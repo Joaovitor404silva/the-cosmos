@@ -14,6 +14,11 @@ anyhow = "1"
 tracing = "0.1"
 ureq = "3"
 
+[features]
+# Test hooks (simulated NAT). Never enable in shipped builds.
+test-util = []
+
 [dev-dependencies]
+cosmos-net = { path = ".", features = ["test-util"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "test-util", "io-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

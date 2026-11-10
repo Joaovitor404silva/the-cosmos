@@ -451,6 +451,7 @@ name = "cosmos-net"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cosmos-net",
  "futures",
  "libp2p",
  "sha2 0.10.9",

@@ -15,6 +15,7 @@ use cosmos_net::{
 use sha2::{Digest, Sha256};
 use std::future::Future;
 use std::time::{Duration, Instant};
+use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
 fn base() -> Config {
@@ -266,13 +267,98 @@ async fn forged_addr_record_is_rejected() {
     });
 
     let got = a.peer_addrs(victim).await;
-    assert!(
-        got.as_ref().map_or(true, |v| v.is_empty()),
-        "forged address record accepted: {got:?}"
-    );
+    assert!(got.is_err(), "forged address record accepted: {got:?}");
     let err = timeout(Duration::from_secs(25), a.connect(victim))
         .await
         .expect("connect hung")
         .expect_err("connected to a forged address");
     assert!(err.downcast_ref::<ConnectError>().is_some(), "{err}");
+}
+
+/// Default punch timing (3s poll, 6s window, 20s budget): the requester and
+/// the target must still overlap their dial windows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn punch_connects_with_default_timing() {
+    let d = Config::default();
+    let cfg = Config {
+        punch_poll: d.punch_poll,
+        punch_window: d.punch_window,
+        connect_timeout: d.connect_timeout,
+        ..natted()
+    };
+    let c = Node::start(base()).await.unwrap();
+    let a = join(&c, cfg.clone()).await;
+    let b = join(&c, cfg).await;
+    wait_for("B address record in the DHT", 20, || async {
+        a.peer_addrs(b.peer_id()).await.is_ok_and(|v| !v.is_empty())
+    })
+    .await;
+    let t0 = Instant::now();
+    timeout(Duration::from_secs(25), a.connect(b.peer_id()))
+        .await
+        .expect("connect hung")
+        .expect("punch with default timing failed");
+    println!("punched (default timing) in {:?}", t0.elapsed());
+}
+
+async fn echo_server() -> std::net::SocketAddr {
+    let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = s.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 65535];
+        while let Ok((n, from)) = s.recv_from(&mut buf).await {
+            let _ = s.send_to(&buf[..n], from).await;
+        }
+    });
+    addr
+}
+
+async fn echo_ok(sock: &UdpSocket, port: std::net::SocketAddr) -> bool {
+    if sock.send_to(b"ping", port).await.is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 16];
+    matches!(
+        timeout(Duration::from_millis(500), sock.recv_from(&mut buf)).await,
+        Ok(Ok((4, _)))
+    )
+}
+
+/// A tunnel between two NATed peers must come back after the connection
+/// drops, which needs the punch again (the simulated NAT holes are closed).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn natted_tunnel_recovers_after_drop() {
+    let c = Node::start(base()).await.unwrap();
+    let a = join(&c, natted()).await;
+    let b = join(&c, natted()).await;
+    wait_for("B address record in the DHT", 20, || async {
+        a.peer_addrs(b.peer_id()).await.is_ok_and(|v| !v.is_empty())
+    })
+    .await;
+    b.set_tunnel_target(echo_server().await);
+    b.allow_peer(a.peer_id());
+    a.allow_peer(b.peer_id());
+    let port = timeout(Duration::from_secs(25), a.open_tunnel(b.peer_id()))
+        .await
+        .expect("open_tunnel hung")
+        .expect("open_tunnel over the punch");
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    assert!(echo_ok(&sock, port).await, "tunnel echo before drop");
+
+    // Let the simulated NAT holes expire (10s), then drop the link.
+    tokio::time::sleep(Duration::from_secs(11)).await;
+    a.disconnect(b.peer_id());
+    b.disconnect(a.peer_id());
+    wait_for("A-B disconnected", 10, || async {
+        a.connections(b.peer_id()).await.is_empty()
+    })
+    .await;
+    let start = Instant::now();
+    while !echo_ok(&sock, port).await {
+        assert!(
+            start.elapsed() < Duration::from_secs(28),
+            "tunnel did not recover after drop"
+        );
+    }
+    println!("tunnel recovered in {:?}", start.elapsed());
 }

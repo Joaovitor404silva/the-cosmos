@@ -73,8 +73,10 @@ pub struct Config {
     pub punch_poll: Duration,
     /// How long both sides keep dialing each other during a punch.
     pub punch_window: Duration,
-    /// Test only: behave like a NAT and refuse inbound connections from any
-    /// socket this node did not dial first. Also keeps kad in client mode.
+    /// Test only (feature `test-util`): behave like a NAT and refuse inbound
+    /// connections from any socket this node did not dial first. Also keeps
+    /// kad in client mode. Not present in normal builds.
+    #[cfg(feature = "test-util")]
     #[doc(hidden)]
     pub nat_sim: bool,
 }
@@ -115,6 +117,7 @@ impl Default for Config {
             connect_timeout: Duration::from_secs(20),
             punch_poll: Duration::from_secs(3),
             punch_window: Duration::from_secs(6),
+            #[cfg(feature = "test-util")]
             nat_sim: false,
         }
     }
@@ -327,6 +330,11 @@ enum Command {
         peer: PeerId,
         win: portguess::Win,
     },
+    PutInbox {
+        topic: String,
+        bytes: Vec<u8>,
+        ttl: Duration,
+    },
 }
 
 enum Inner {
@@ -349,7 +357,9 @@ enum Inner {
     },
     Note(tunnel::Note),
     Fallback(Result<Vec<Multiaddr>, String>),
-    PunchRequests(Vec<Record>),
+    Reconnected {
+        peer: PeerId,
+    },
     Put {
         topic: String,
         bytes: Vec<u8>,
@@ -392,6 +402,9 @@ enum Pending {
     },
     AddrPut {
         addrs: Vec<Multiaddr>,
+    },
+    Inbox {
+        slot: u8,
     },
 }
 
@@ -474,6 +487,49 @@ const ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn topic_key(topic: &str) -> kad::RecordKey {
     kad::RecordKey::new(&Sha256::digest(topic.as_bytes()).to_vec())
+}
+
+/// Key a stored record must sit under: `record_key(topic, publisher)`, or
+/// `topic_key(topic)` for punch inbox slots (any requester may write them).
+fn stored_key_ok(key: &kad::RecordKey, rec: &Record) -> bool {
+    *key == record_key(&rec.topic, &rec.publisher)
+        || (punch::parse_inbox_topic(&rec.topic).is_some() && *key == topic_key(&rec.topic))
+}
+
+/// Reader side of `Node::get`: only a record signed by `publisher` for `topic`.
+fn get_filter(value: &[u8], topic: &str, publisher: &PeerId) -> Option<Record> {
+    Record::verify(value).filter(|rec| rec.topic == topic && rec.publisher == *publisher)
+}
+
+/// Event-loop copy of the dialer: holds a weak command sender so the loop
+/// still stops once every `Node` handle is dropped.
+struct DialerSeed {
+    cmd: mpsc::WeakUnboundedSender<Command>,
+    keypair: Keypair,
+    events: broadcast::Sender<Event>,
+    cfg: Arc<Config>,
+}
+
+impl DialerSeed {
+    fn upgrade(&self) -> Option<Dialer> {
+        Some(Dialer {
+            me: self.keypair.public().to_peer_id(),
+            keypair: self.keypair.clone(),
+            cmd: self.cmd.upgrade()?,
+            events: self.events.clone(),
+            cfg: self.cfg.clone(),
+        })
+    }
+}
+
+#[cfg(feature = "test-util")]
+fn nat_sim(cfg: &Config) -> bool {
+    cfg.nat_sim
+}
+
+#[cfg(not(feature = "test-util"))]
+fn nat_sim(_: &Config) -> bool {
+    false
 }
 
 fn record_key(topic: &str, publisher: &PeerId) -> kad::RecordKey {
@@ -667,7 +723,7 @@ fn build_swarm(cfg: &Config, keypair: Keypair, blocked: PeerSet) -> anyhow::Resu
                 local_only,
                 dns_peers.clone(),
             );
-            kad.set_mode(Some(if cfg.nat_sim {
+            kad.set_mode(Some(if nat_sim(&cfg) {
                 kad::Mode::Client
             } else {
                 kad::Mode::Server
@@ -700,7 +756,7 @@ fn build_swarm(cfg: &Config, keypair: Keypair, blocked: PeerSet) -> anyhow::Resu
             });
             Ok(Behaviour {
                 limits: connection_limits::Behaviour::new(cfg.limits.libp2p()),
-                ip_limit: discovery::IpLimit::new(cfg.limits.max_inbound_per_ip, blocked, cfg.nat_sim),
+                ip_limit: discovery::IpLimit::new(cfg.limits.max_inbound_per_ip, blocked, nat_sim(&cfg)),
                 ipfs: ipfs.into(),
                 identify: identify::Behaviour::new(identify_config(key.public())),
                 ping: ping::Behaviour::default(),
@@ -815,6 +871,7 @@ impl Node {
         let topics: Topics = Arc::new(Mutex::new(HashMap::new()));
         let own: Own = Arc::new(Mutex::new(HashMap::new()));
         let (cmd, cmd_rx) = mpsc::unbounded_channel();
+        let shared_cfg = Arc::new(cfg.clone());
         let (inner_tx, inner_rx) = mpsc::unbounded_channel();
         let (note_tx, note_rx) = mpsc::unbounded_channel();
         let targets: tunnel::SharedTargets = Arc::new(Mutex::new(tunnel::Targets {
@@ -835,7 +892,14 @@ impl Node {
             addr_refresh: now,
             addr_putting: false,
             punch_next: now,
-            punch_polling: false,
+            inbox_q: HashMap::new(),
+            dialer: DialerSeed {
+                cmd: cmd.downgrade(),
+                keypair: keypair.clone(),
+                events: events.clone(),
+                cfg: shared_cfg.clone(),
+            },
+            reconnecting: HashSet::new(),
             punch_seen: HashMap::new(),
             punch_dials: HashMap::new(),
             guesses: HashMap::new(),
@@ -903,7 +967,7 @@ impl Node {
             gate,
             blocked,
             permanently_blocked,
-            cfg: Arc::new(cfg),
+            cfg: shared_cfg,
         })
     }
 
@@ -1155,155 +1219,16 @@ impl Node {
     /// port guess. Fails with `ConnectError::NoPath` within
     /// `Config::connect_timeout`.
     pub async fn connect(&self, peer: PeerId) -> anyhow::Result<()> {
-        if peer == self.peer_id {
-            return Err(anyhow!("cannot connect to self"));
-        }
-        let deadline = Instant::now() + self.cfg.connect_timeout;
-        match tokio::time::timeout_at(deadline, self.connect_ladder(peer, deadline)).await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => {
-                tracing::debug!(%peer, "no path: {e:#}");
-                Err(ConnectError::NoPath { peer }.into())
-            }
-            Err(_) => Err(ConnectError::NoPath { peer }.into()),
-        }
+        self.dialer().connect(peer).await
     }
 
-    async fn connected_within(&self, peer: PeerId, wait: Duration) -> bool {
-        let end = Instant::now() + wait;
-        loop {
-            if !self.connections(peer).await.is_empty() {
-                return true;
-            }
-            if Instant::now() >= end {
-                return false;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    }
-
-    async fn connect_ladder(&self, peer: PeerId, deadline: Instant) -> anyhow::Result<()> {
-        let direct_until = Instant::now() + self.cfg.connect_timeout / 3;
-        let mut last = anyhow!("direct dial timed out");
-        loop {
-            match tokio::time::timeout_at(direct_until, self.try_connect(peer)).await {
-                Ok(Ok(())) => return Ok(()),
-                Ok(Err(e)) => last = e,
-                Err(_) => break,
-            }
-            if Instant::now() + DIRECT_RETRY >= direct_until {
-                break;
-            }
-            tokio::time::sleep(DIRECT_RETRY).await;
-        }
-        let addrs = match self.peer_addrs(peer).await {
-            Ok(a) => a,
-            Err(e) => return Err(last.context(format!("{e:#}"))),
-        };
-        if !self.cfg.hole_punch {
-            let _ = self.cmd.send(Command::DialPeer { peer, addrs });
-            if self.connected_within(peer, Duration::from_secs(2)).await {
-                return Ok(());
-            }
-            return Err(anyhow!("direct dial failed and hole punching is off"));
-        }
-        let guess_nonce = portguess::nonce();
-        let own_ip4 = if self.cfg.port_guess {
-            self.ask(|reply| Command::OwnIp4 { reply }).await
-        } else {
-            None
-        };
-        let guess = own_ip4.map(|ip| (ip, guess_nonce));
-        if self.punch(peer, &addrs, guess, deadline).await {
-            return Ok(());
-        }
-        if guess.is_some() && self.guess(peer, &addrs, guess_nonce, deadline).await {
-            return Ok(());
-        }
-        Err(anyhow!("hole punch failed"))
-    }
-
-    /// Ask `peer` through the DHT to dial us back, and dial it meanwhile.
-    async fn punch(
-        &self,
-        peer: PeerId,
-        addrs: &[Multiaddr],
-        guess: Option<(Ipv4Addr, [u8; 16])>,
-        deadline: Instant,
-    ) -> bool {
-        let req = punch::Request {
-            dial_at_ms: punch::now_ms() + self.cfg.punch_poll.as_millis() as u64,
-            nonce: portguess::nonce(),
-            addrs: self.ask(|reply| Command::Advertised { reply }).await,
-            guess,
-        };
-        let topic = punch::punch_topic(&peer);
-        let ttl = self.cfg.punch_poll * 2 + self.cfg.punch_window + PUNCH_TTL_SLACK;
-        let Ok(bytes) = Record::sign(&self.keypair, &topic, req.encode(), ttl) else {
-            return false;
-        };
-        let (reply, _done) = oneshot::channel();
-        let _ = self.cmd.send(Command::Publish {
-            topic,
-            bytes,
-            reply,
-        });
-        let until =
-            (Instant::now() + self.cfg.punch_poll * 2 + self.cfg.punch_window).min(deadline);
-        let mut ok = false;
-        while Instant::now() < until {
-            let _ = self.cmd.send(Command::DialPeer {
-                peer,
-                addrs: addrs.to_vec(),
-            });
-            if self.connected_within(peer, PUNCH_DIAL_EVERY).await {
-                ok = true;
-                break;
-            }
-        }
-        let _ = self.events.send(Event::HolePunch { peer, ok });
-        ok
-    }
-
-    /// Initiator side of a port guess, after the punch failed.
-    async fn guess(
-        &self,
-        peer: PeerId,
-        addrs: &[Multiaddr],
-        mine: [u8; 16],
-        deadline: Instant,
-    ) -> bool {
-        let topic = punch::guess_topic(&self.peer_id);
-        let ips: Vec<Ipv4Addr> = addrs.iter().filter_map(ip4_of).collect();
-        let theirs = loop {
-            if let Ok(Ok(Some(rec))) =
-                tokio::time::timeout(GET_TIMEOUT, self.get(&topic, peer)).await
-            {
-                if let Some(o) = punch::guess_answer_of(&rec, &self.peer_id, &peer) {
-                    break Some(o);
-                }
-            }
-            if Instant::now() + PUNCH_DIAL_EVERY >= deadline {
-                break None;
-            }
-            tokio::time::sleep(PUNCH_DIAL_EVERY).await;
-        };
-        let Some(theirs) = theirs.filter(|o| ips.contains(&o.ip)) else {
-            let _ = self.events.send(Event::PortGuess { peer, ok: false });
-            return false;
-        };
-        let plan = self.cfg.port_guess_plan.clone();
-        match portguess::many(&plan, theirs, mine).await {
-            Ok(win) => {
-                let _ = self.cmd.send(Command::GuessWon { peer, win });
-                let left = deadline.saturating_duration_since(Instant::now());
-                self.connected_within(peer, left).await
-            }
-            Err(e) => {
-                tracing::debug!(%peer, "port guess: {e}");
-                let _ = self.events.send(Event::PortGuess { peer, ok: false });
-                false
-            }
+    fn dialer(&self) -> Dialer {
+        Dialer {
+            me: self.peer_id,
+            keypair: self.keypair.clone(),
+            cmd: self.cmd.clone(),
+            events: self.events.clone(),
+            cfg: self.cfg.clone(),
         }
     }
 
@@ -1332,12 +1257,236 @@ impl Node {
 
     /// Addresses `peer` published in its signed DHT address record.
     pub async fn peer_addrs(&self, peer: PeerId) -> anyhow::Result<Vec<Multiaddr>> {
+        self.dialer().peer_addrs(peer).await
+    }
+}
+
+/// The connect ladder (direct, DHT-signaled punch, port guess), usable both
+/// from `Node` and from the event loop (tunnel reconnects).
+#[derive(Clone)]
+struct Dialer {
+    me: PeerId,
+    keypair: Keypair,
+    cmd: mpsc::UnboundedSender<Command>,
+    events: broadcast::Sender<Event>,
+    cfg: Arc<Config>,
+}
+
+impl Dialer {
+    async fn call<T>(&self, f: impl FnOnce(Reply<T>) -> Command) -> anyhow::Result<T> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd.send(f(tx)).map_err(|_| anyhow!("node stopped"))?;
+        rx.await.map_err(|_| anyhow!("node stopped"))?
+    }
+
+    async fn ask<T: Default>(&self, f: impl FnOnce(oneshot::Sender<T>) -> Command) -> T {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.cmd.send(f(tx));
+        rx.await.unwrap_or_default()
+    }
+
+    async fn connected_now(&self, peer: PeerId) -> bool {
+        !self
+            .ask(|reply| Command::Connections { peer, reply })
+            .await
+            .is_empty()
+    }
+
+    async fn connected_within(&self, peer: PeerId, wait: Duration) -> bool {
+        let end = Instant::now() + wait;
+        loop {
+            if self.connected_now(peer).await {
+                return true;
+            }
+            if Instant::now() >= end {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    async fn connect(&self, peer: PeerId) -> anyhow::Result<()> {
+        if peer == self.me {
+            return Err(anyhow!("cannot connect to self"));
+        }
+        let deadline = Instant::now() + self.cfg.connect_timeout;
+        match tokio::time::timeout_at(deadline, self.connect_ladder(peer, deadline)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
+                tracing::debug!(%peer, "no path: {e:#}");
+                Err(ConnectError::NoPath { peer }.into())
+            }
+            Err(_) => Err(ConnectError::NoPath { peer }.into()),
+        }
+    }
+
+    /// Direct dial and the address lookup run together. As soon as the
+    /// signed address record is in hand the punch starts (it keeps dialing
+    /// directly too), so the punch gets most of the connect budget.
+    async fn connect_ladder(&self, peer: PeerId, deadline: Instant) -> anyhow::Result<()> {
+        let direct_until = (Instant::now() + self.cfg.connect_timeout / 3).min(deadline);
+        let direct = async {
+            match tokio::time::timeout_at(
+                direct_until,
+                self.call(|reply| Command::Connect { peer, reply }),
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(_) => Err(anyhow!("direct dial timed out")),
+            }
+        };
+        let lookup = self.peer_addrs(peer);
+        tokio::pin!(direct, lookup);
+        let mut direct_err: Option<anyhow::Error> = None;
+        let addrs = loop {
+            tokio::select! {
+                r = &mut direct, if direct_err.is_none() => match r {
+                    Ok(()) => return Ok(()),
+                    Err(e) => direct_err = Some(e),
+                },
+                r = &mut lookup => match r {
+                    Ok(a) => break a,
+                    Err(e) => {
+                        let last = match direct_err {
+                            Some(d) => d,
+                            None => match (&mut direct).await {
+                                Ok(()) => return Ok(()),
+                                Err(d) => d,
+                            },
+                        };
+                        return Err(last.context(format!("{e:#}")));
+                    }
+                },
+            }
+        };
+        if !self.cfg.hole_punch {
+            let _ = self.cmd.send(Command::DialPeer { peer, addrs });
+            if self.connected_within(peer, Duration::from_secs(2)).await {
+                return Ok(());
+            }
+            return Err(anyhow!("direct dial failed and hole punching is off"));
+        }
+        let guess_nonce = portguess::nonce();
+        let own_ip4 = if self.cfg.port_guess {
+            self.ask(|reply| Command::OwnIp4 { reply }).await
+        } else {
+            None
+        };
+        let guess = own_ip4.map(|ip| (ip, guess_nonce));
+        let punch_until = if guess.is_some() {
+            Instant::now() + deadline.saturating_duration_since(Instant::now()) / 2
+        } else {
+            deadline
+        };
+        if self.punch(peer, &addrs, guess, punch_until).await {
+            return Ok(());
+        }
+        if guess.is_some() && self.guess(peer, &addrs, guess_nonce, deadline).await {
+            return Ok(());
+        }
+        Err(anyhow!("hole punch failed"))
+    }
+
+    /// Put a signed punch request into a random inbox slot of `peer` (again
+    /// every poll, in case another requester took the slot) and dial it
+    /// until connected or `until`.
+    async fn punch(
+        &self,
+        peer: PeerId,
+        addrs: &[Multiaddr],
+        guess: Option<(Ipv4Addr, [u8; 16])>,
+        until: Instant,
+    ) -> bool {
+        let req = punch::Request {
+            nonce: portguess::nonce(),
+            addrs: self.ask(|reply| Command::Advertised { reply }).await,
+            guess,
+        };
+        let ttl = (self.cfg.punch_poll * 2 + self.cfg.punch_window).min(punch::INBOX_MAX_TTL);
+        let mut put_next = Instant::now();
+        let mut ok = false;
+        while Instant::now() < until {
+            if Instant::now() >= put_next {
+                put_next = Instant::now() + self.cfg.punch_poll;
+                let slot = portguess::nonce()[0] % punch::INBOX_SLOTS;
+                let topic = punch::inbox_topic(&peer, slot);
+                if let Ok(bytes) = Record::sign(&self.keypair, &topic, req.encode(), ttl) {
+                    let _ = self.cmd.send(Command::PutInbox { topic, bytes, ttl });
+                }
+            }
+            let _ = self.cmd.send(Command::DialPeer {
+                peer,
+                addrs: addrs.to_vec(),
+            });
+            if self.connected_within(peer, PUNCH_DIAL_EVERY).await {
+                ok = true;
+                break;
+            }
+        }
+        let _ = self.events.send(Event::HolePunch { peer, ok });
+        ok
+    }
+
+    /// Initiator side of a port guess, after the punch failed.
+    async fn guess(
+        &self,
+        peer: PeerId,
+        addrs: &[Multiaddr],
+        mine: [u8; 16],
+        deadline: Instant,
+    ) -> bool {
+        let topic = punch::guess_topic(&self.me);
+        let ips: Vec<Ipv4Addr> = addrs.iter().filter_map(ip4_of).collect();
+        let theirs = loop {
+            if let Ok(Ok(Some(rec))) =
+                tokio::time::timeout(GET_TIMEOUT, self.get(&topic, peer)).await
+            {
+                if let Some(o) = punch::guess_answer_of(&rec, &self.me, &peer) {
+                    break Some(o);
+                }
+            }
+            if Instant::now() + PUNCH_DIAL_EVERY >= deadline {
+                break None;
+            }
+            tokio::time::sleep(PUNCH_DIAL_EVERY).await;
+        };
+        let Some(theirs) = theirs.filter(|o| ips.contains(&o.ip)) else {
+            let _ = self.events.send(Event::PortGuess { peer, ok: false });
+            return false;
+        };
+        let plan = self.cfg.port_guess_plan.clone();
+        match portguess::many(&plan, theirs, mine).await {
+            Ok(win) => {
+                let _ = self.cmd.send(Command::GuessWon { peer, win });
+                let left = deadline.saturating_duration_since(Instant::now());
+                self.connected_within(peer, left).await
+            }
+            Err(e) => {
+                tracing::debug!(%peer, "port guess: {e}");
+                let _ = self.events.send(Event::PortGuess { peer, ok: false });
+                false
+            }
+        }
+    }
+
+    async fn get(&self, topic: &str, publisher: PeerId) -> anyhow::Result<Option<Record>> {
+        self.call(|reply| Command::Get {
+            topic: topic.to_string(),
+            publisher,
+            reply,
+        })
+        .await
+    }
+
+    async fn peer_addrs(&self, peer: PeerId) -> anyhow::Result<Vec<Multiaddr>> {
         let rec = tokio::time::timeout(GET_TIMEOUT, self.get(punch::ADDR_TOPIC, peer))
             .await
             .map_err(|_| anyhow!("address lookup timed out"))??;
         rec.and_then(|r| punch::addrs_of(&r, &peer))
             .ok_or_else(|| anyhow!("no address record for {peer}"))
     }
+
 }
 
 #[derive(Clone, Copy)]
@@ -1357,9 +1506,11 @@ struct EventLoop {
     addr_refresh: Instant,
     addr_putting: bool,
     punch_next: Instant,
-    punch_polling: bool,
+    inbox_q: HashMap<kad::QueryId, Instant>,
     punch_seen: HashMap<(PeerId, [u8; 16]), Instant>,
     punch_dials: HashMap<PeerId, PunchDial>,
+    dialer: DialerSeed,
+    reconnecting: HashSet<PeerId>,
     guesses: HashMap<PeerId, Guess>,
     events: broadcast::Sender<Event>,
     topics: Topics,
@@ -1445,15 +1596,18 @@ const IPFS_REPROVIDE_MIN: Duration = Duration::from_secs(30);
 const IPFS_LOOKUP_FOUND: Duration = Duration::from_secs(300);
 const CACHE_SAVE_EVERY: Duration = Duration::from_secs(2);
 const MESH_BOOTSTRAP_EVERY: Duration = Duration::from_secs(5);
-const DIRECT_RETRY: Duration = Duration::from_millis(400);
 const GET_TIMEOUT: Duration = Duration::from_secs(5);
 const PUNCH_DIAL_EVERY: Duration = Duration::from_millis(500);
 const PUNCH_FIND: Duration = Duration::from_secs(5);
 const PUNCH_TTL_SLACK: Duration = Duration::from_secs(30);
-const PUNCH_MAX_PER_POLL: usize = 8;
 const PUNCH_SEEN_MAX: usize = 1024;
-const PUNCH_SEEN_FOR: Duration = Duration::from_secs(120);
-const PUNCH_AHEAD_MS: u64 = 30_000;
+/// Longer than an inbox record can live (max TTL + clock skew).
+const PUNCH_SEEN_FOR: Duration = Duration::from_secs(200);
+/// Reflection caps: addresses dialed per request, requesters dialed at once,
+/// and requesters sharing one IP (a household behind one NAT).
+const PUNCH_ADDRS_MAX: usize = 4;
+const PUNCH_DIALS_MAX: usize = 8;
+const PUNCH_PER_IP: usize = 3;
 const ADDR_RETRY: Duration = Duration::from_secs(1);
 const GUESSES_MAX: usize = 4;
 const GUESS_DIAL_DELAY: Duration = Duration::from_millis(300);
@@ -1691,6 +1845,22 @@ impl EventLoop {
             Command::Advertised { reply } => {
                 let _ = reply.send(self.advertised());
             }
+            Command::PutInbox { topic, bytes, ttl } => {
+                let rec = kad::Record {
+                    key: topic_key(&topic),
+                    value: bytes,
+                    publisher: Some(me),
+                    expires: Some(std::time::Instant::now() + ttl),
+                };
+                if let Err(e) = self
+                    .swarm
+                    .behaviour_mut()
+                    .kad
+                    .put_record(rec, kad::Quorum::One)
+                {
+                    tracing::debug!("punch request not stored: {e:?}");
+                }
+            }
             Command::OwnIp4 { reply } => {
                 let _ = reply.send(self.own_ip4());
             }
@@ -1829,7 +1999,7 @@ impl EventLoop {
 
     fn start_open(&mut self, peer: PeerId) {
         let Some((conn, rank)) = self.best_conn(&peer) else {
-            self.connect_peer(peer, None);
+            self.reconnect(peer);
             return;
         };
         let sid = self.next_sid;
@@ -2085,7 +2255,9 @@ impl EventLoop {
                 self.drop_tunnel(peer, "closed by peer", false)
             }
             Inner::Fallback(r) => self.on_fallback(r),
-            Inner::PunchRequests(recs) => self.on_punch_requests(recs),
+            Inner::Reconnected { peer } => {
+                self.reconnecting.remove(&peer);
+            }
             Inner::Put { topic, bytes } => {
                 let rec = kad::Record {
                     key: record_key(&topic, &self.me),
@@ -2211,26 +2383,29 @@ impl EventLoop {
         }
     }
 
-    /// Poll the DHT for punch requests aimed at us and dial the requesters.
+    /// Poll our punch inbox slots and keep dialing requesters.
     fn punch_tick(&mut self, now: Instant) {
-        if self.cfg.hole_punch && !self.punch_polling && now >= self.punch_next {
-            self.punch_polling = true;
+        let stale: Vec<kad::QueryId> = self
+            .inbox_q
+            .iter()
+            .filter(|(_, at)| now.duration_since(**at) > PUNCH_FIND)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in stale {
+            self.inbox_q.remove(&id);
+            self.pending.remove(&id);
+            if let Some(mut q) = self.swarm.behaviour_mut().kad.query_mut(&id) {
+                q.finish();
+            }
+        }
+        if self.cfg.hole_punch && self.inbox_q.is_empty() && now >= self.punch_next {
             self.punch_next = now + self.cfg.punch_poll;
-            let (tx, rx) = oneshot::channel();
-            self.on_command(Command::Find {
-                topic: punch::punch_topic(&self.me),
-                deadline: PUNCH_FIND,
-                complete: false,
-                reply: tx,
-            });
-            let inner = self.inner_tx.clone();
-            tokio::spawn(async move {
-                let recs = match rx.await {
-                    Ok(Ok((recs, _))) => recs,
-                    _ => vec![],
-                };
-                let _ = inner.send(Inner::PunchRequests(recs));
-            });
+            for slot in 0..punch::INBOX_SLOTS {
+                let key = topic_key(&punch::inbox_topic(&self.me, slot));
+                let id = self.swarm.behaviour_mut().kad.get_record(key);
+                self.inbox_q.insert(id, now);
+                self.pending.insert(id, Pending::Inbox { slot });
+            }
         }
         let peers: Vec<PeerId> = self.punch_dials.keys().copied().collect();
         for peer in peers {
@@ -2254,68 +2429,87 @@ impl EventLoop {
         }
     }
 
-    fn on_punch_requests(&mut self, recs: Vec<Record>) {
-        self.punch_polling = false;
-        let now_ms = punch::now_ms();
-        let window = self.cfg.punch_window.as_millis() as u64;
+    /// A punch request found in inbox `slot`: dial the requester right away
+    /// for the punch window, within the reflection caps.
+    fn on_inbox(&mut self, rec: Record, slot: u8) {
+        let peer = rec.publisher;
+        let Some(req) = punch::inbox_request(&rec, &self.me, slot) else {
+            return;
+        };
+        if self.punch_dials.contains_key(&peer)
+            || self.punch_seen.contains_key(&(peer, req.nonce))
+            || self.connected(&peer)
+            || self.punch_dials.len() >= PUNCH_DIALS_MAX
+        {
+            return;
+        }
         let local_only = self.local_only();
-        let topic = punch::punch_topic(&self.me);
-        self.punch_seen.retain(|_, at| at.elapsed() < PUNCH_SEEN_FOR);
-        let mut started = 0;
-        for rec in recs {
-            if started >= PUNCH_MAX_PER_POLL {
-                break;
-            }
-            let peer = rec.publisher;
-            if rec.topic != topic || peer == self.me || self.punch_dials.contains_key(&peer) {
-                continue;
-            }
-            let Some(req) = punch::Request::decode(&rec.data) else {
-                continue;
-            };
-            if req.dial_at_ms.saturating_add(window) < now_ms
-                || req.dial_at_ms > now_ms + PUNCH_AHEAD_MS
-                || self.punch_seen.contains_key(&(peer, req.nonce))
-                || self.punch_seen.len() >= PUNCH_SEEN_MAX
-            {
-                continue;
-            }
-            self.punch_seen.insert((peer, req.nonce), Instant::now());
-            if self.connected(&peer) {
-                continue;
-            }
-            let lan = self.mdns_peers.contains(&peer);
-            let addrs: Vec<Multiaddr> = req
-                .addrs
-                .iter()
-                .map(|a| split_peer(a).map(|(_, b)| b).unwrap_or_else(|| a.clone()))
-                .filter(|a| !is_unspecified(a) && !is_dns(a))
-                .filter(|a| match addr_scope(a) {
-                    Scope::Public => true,
-                    Scope::Loopback => local_only,
-                    Scope::Private => lan,
+        let lan = self.mdns_peers.contains(&peer);
+        let busy_ips: Vec<IpAddr> = self
+            .punch_dials
+            .values()
+            .flat_map(|d| d.addrs.iter().filter_map(discovery::ip_of))
+            .collect();
+        let addrs: Vec<Multiaddr> = req
+            .addrs
+            .iter()
+            .map(|a| split_peer(a).map(|(_, b)| b).unwrap_or_else(|| a.clone()))
+            .filter(|a| !is_unspecified(a) && !is_dns(a))
+            .filter(|a| match addr_scope(a) {
+                Scope::Public => true,
+                Scope::Loopback => local_only,
+                Scope::Private => lan,
+            })
+            .filter(|a| {
+                discovery::ip_of(a).is_none_or(|ip| {
+                    local_only || busy_ips.iter().filter(|b| **b == ip).count() < PUNCH_PER_IP
                 })
-                .collect();
-            if addrs.is_empty() {
-                continue;
-            }
-            started += 1;
-            tracing::debug!(%peer, ?addrs, "punch requested");
-            self.emit(Event::PunchRequested { peer });
-            let wait = Duration::from_millis(req.dial_at_ms.saturating_sub(now_ms));
-            let start = Instant::now() + wait;
-            self.punch_dials.insert(
-                peer,
-                PunchDial {
-                    next: start,
-                    until: start + self.cfg.punch_window,
-                    addrs: addrs.clone(),
-                },
-            );
-            if let Some((ip, nonce)) = req.guess {
-                self.start_guess(peer, ip, nonce, &addrs);
+            })
+            .take(PUNCH_ADDRS_MAX)
+            .collect();
+        if addrs.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        self.punch_seen.retain(|_, at| now.duration_since(*at) < PUNCH_SEEN_FOR);
+        if self.punch_seen.len() >= PUNCH_SEEN_MAX {
+            if let Some(oldest) = self.punch_seen.iter().min_by_key(|(_, at)| **at).map(|(k, _)| *k) {
+                self.punch_seen.remove(&oldest);
             }
         }
+        self.punch_seen.insert((peer, req.nonce), now);
+        tracing::debug!(%peer, ?addrs, "punch requested");
+        self.emit(Event::PunchRequested { peer });
+        self.punch_dials.insert(
+            peer,
+            PunchDial {
+                next: now,
+                until: now + self.cfg.punch_window,
+                addrs: addrs.clone(),
+            },
+        );
+        if let Some((ip, nonce)) = req.guess {
+            self.start_guess(peer, ip, nonce, &addrs);
+        }
+    }
+
+    /// No connection to a tunnel peer: run the full connect ladder (incl.
+    /// the DHT punch) in the background, once at a time per peer.
+    fn reconnect(&mut self, peer: PeerId) {
+        if !self.reconnecting.insert(peer) {
+            return;
+        }
+        let Some(d) = self.dialer.upgrade() else {
+            self.reconnecting.remove(&peer);
+            return;
+        };
+        let inner = self.inner_tx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = d.connect(peer).await {
+                tracing::debug!(%peer, "tunnel reconnect: {e:#}");
+            }
+            let _ = inner.send(Inner::Reconnected { peer });
+        });
     }
 
     /// Target side of a port guess: publish our offer, then spray.
@@ -2898,8 +3092,7 @@ impl EventLoop {
                         ..
                     },
             } => {
-                let Some(rec) = Record::verify(&r.value)
-                    .filter(|rec| r.key == record_key(&rec.topic, &rec.publisher))
+                let Some(rec) = Record::verify(&r.value).filter(|rec| stored_key_ok(&r.key, rec))
                 else {
                     tracing::debug!(%source, "dropping unverified kad record");
                     return;
@@ -3074,8 +3267,9 @@ impl EventLoop {
                 kad::QueryResult::GetRecord(r),
             ) => {
                 let rec = match r {
-                    Ok(kad::GetRecordOk::FoundRecord(pr)) => Record::verify(&pr.record.value)
-                        .filter(|rec| rec.topic == topic && rec.publisher == publisher),
+                    Ok(kad::GetRecordOk::FoundRecord(pr)) => {
+                        get_filter(&pr.record.value, &topic, &publisher)
+                    }
                     _ => None,
                 };
                 if rec.is_none() && !last {
@@ -3093,6 +3287,24 @@ impl EventLoop {
                     q.finish();
                 }
                 let _ = reply.send(Ok(rec));
+            }
+            (Pending::Inbox { slot }, kad::QueryResult::GetRecord(r)) => {
+                let rec = match r {
+                    Ok(kad::GetRecordOk::FoundRecord(pr)) => Record::verify(&pr.record.value),
+                    _ => None,
+                };
+                let done = rec.is_some() || last;
+                if let Some(rec) = rec {
+                    self.on_inbox(rec, slot);
+                }
+                if done {
+                    self.inbox_q.remove(&id);
+                    if let Some(mut q) = self.swarm.behaviour_mut().kad.query_mut(&id) {
+                        q.finish();
+                    }
+                } else {
+                    self.pending.insert(id, Pending::Inbox { slot });
+                }
             }
             (Pending::AddrPut { addrs }, kad::QueryResult::PutRecord(r)) => {
                 self.addr_putting = false;
@@ -3496,6 +3708,37 @@ pub fn topic_for(namespace: &str, kind: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn get_filter_rejects_validly_signed_record_from_another_key() {
+        let victim = Keypair::generate_ed25519().public().to_peer_id();
+        let attacker = Keypair::generate_ed25519();
+        let bytes = Record::sign(
+            &attacker,
+            punch::ADDR_TOPIC,
+            punch::encode_addrs(&["/ip4/6.6.6.6/tcp/1".parse().unwrap()]),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        assert!(Record::verify(&bytes).is_some(), "record itself is valid");
+        assert_eq!(super::get_filter(&bytes, punch::ADDR_TOPIC, &victim), None);
+        let me = attacker.public().to_peer_id();
+        assert!(super::get_filter(&bytes, punch::ADDR_TOPIC, &me).is_some());
+        assert_eq!(super::get_filter(&bytes, "cosmos/other", &me), None);
+    }
+
+    #[test]
+    fn stored_key_ok_allows_inbox_slots_only_under_their_topic_key() {
+        let k = Keypair::generate_ed25519();
+        let target = PeerId::random();
+        let inbox = punch::inbox_topic(&target, 1);
+        let rec = Record::verify(&Record::sign(&k, &inbox, vec![1], Duration::from_secs(30)).unwrap()).unwrap();
+        assert!(super::stored_key_ok(&super::topic_key(&inbox), &rec));
+        assert!(super::stored_key_ok(&super::record_key(&inbox, &rec.publisher), &rec));
+        assert!(!super::stored_key_ok(&super::topic_key(&punch::inbox_topic(&target, 2)), &rec));
+        let plain = Record::verify(&Record::sign(&k, "cosmos/x", vec![1], Duration::from_secs(30)).unwrap()).unwrap();
+        assert!(!super::stored_key_ok(&super::topic_key("cosmos/x"), &plain));
+    }
+
     use super::*;
 
     fn ma(s: &str) -> Multiaddr {
