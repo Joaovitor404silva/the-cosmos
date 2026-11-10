@@ -1,11 +1,5 @@
-//! Sessions, channels and the async record API (M1+).
+//! Sessions, channels and join codes on top of `cosmos-net`.
 
-pub const CRATE: &str = "cosmos-core";
+pub mod channel;
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_name() {
-        assert_eq!(super::CRATE, env!("CARGO_PKG_NAME"));
-    }
-}
+pub use channel::{Channel, ChannelCaps, Delivery};
