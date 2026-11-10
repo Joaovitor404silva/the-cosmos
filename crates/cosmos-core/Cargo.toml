@@ -10,6 +10,7 @@ cosmos-net = { path = "../cosmos-net" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 futures = "0.3"
 sha2 = "0.10"
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 anyhow = "1"
 tracing = "0.1"
 
