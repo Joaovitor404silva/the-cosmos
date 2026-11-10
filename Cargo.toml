@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = ["crates/cosmos-core", "crates/cosmos-ffi", "crates/cosmos-steam"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
