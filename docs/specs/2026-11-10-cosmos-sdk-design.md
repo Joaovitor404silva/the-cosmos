@@ -89,4 +89,4 @@ Small original top-down 2D co-op game in C + raylib (zlib license), single windo
 - No GPL code.
 
 ## Open questions
-2. Engine bindings later (Unity C#, UE plugin, UE4SS Lua) — after the C ABI is stable.
+1. Engine bindings later (Unity C#, UE plugin, UE4SS Lua) — after the C ABI is stable.
