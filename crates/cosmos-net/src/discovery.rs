@@ -289,9 +289,6 @@ impl ConnLimits {
 }
 
 pub fn ip_of(a: &Multiaddr) -> Option<IpAddr> {
-    if a.iter().any(|p| p == Protocol::P2pCircuit) {
-        return None;
-    }
     a.iter().find_map(|p| match p {
         Protocol::Ip4(ip) => Some(IpAddr::V4(ip)),
         Protocol::Ip6(ip) => Some(
@@ -306,23 +303,10 @@ pub fn ip_of(a: &Multiaddr) -> Option<IpAddr> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum ConnSource {
     Ip(IpAddr),
-    Relay(PeerId),
     Unknown,
 }
 
 fn conn_source(addr: &Multiaddr) -> ConnSource {
-    if addr.iter().any(|protocol| protocol == Protocol::P2pCircuit) {
-        let mut peer = None;
-        for protocol in addr.iter() {
-            match protocol {
-                Protocol::P2p(id) if peer.is_none() => peer = Some(id),
-                Protocol::P2pCircuit => {
-                    return peer.map(ConnSource::Relay).unwrap_or(ConnSource::Unknown);
-                }
-                _ => {}
-            }
-        }
-    }
     ip_of(addr)
         .map(ConnSource::Ip)
         .unwrap_or(ConnSource::Unknown)
@@ -345,14 +329,9 @@ impl IpLimit {
         }
     }
 
-    fn deny_direct(&self, peer: &PeerId, addrs: &[&Multiaddr]) -> Result<(), ConnectionDenied> {
-        let relayed = addrs
-            .iter()
-            .any(|a| a.iter().any(|p| p == Protocol::P2pCircuit));
-        if !relayed && self.blocked.lock().unwrap().contains(peer) {
-            return Err(ConnectionDenied::new(
-                "direct connections to this peer are blocked",
-            ));
+    fn deny_blocked(&self, peer: &PeerId) -> Result<(), ConnectionDenied> {
+        if self.blocked.lock().unwrap().contains(peer) {
+            return Err(ConnectionDenied::new("connections to this peer are blocked"));
         }
         Ok(())
     }
@@ -391,10 +370,10 @@ impl NetworkBehaviour for IpLimit {
         &mut self,
         id: ConnectionId,
         peer: PeerId,
-        local: &Multiaddr,
-        remote: &Multiaddr,
+        _local: &Multiaddr,
+        _remote: &Multiaddr,
     ) -> Result<THandler<Self>, ConnectionDenied> {
-        self.deny_direct(&peer, &[local, remote])?;
+        self.deny_blocked(&peer)?;
         if let Some(ip) = self.pending.remove(&id) {
             self.established.insert(id, ip);
         }
@@ -405,11 +384,11 @@ impl NetworkBehaviour for IpLimit {
         &mut self,
         _id: ConnectionId,
         peer: PeerId,
-        addr: &Multiaddr,
+        _addr: &Multiaddr,
         _role: Endpoint,
         _port_use: PortUse,
     ) -> Result<THandler<Self>, ConnectionDenied> {
-        self.deny_direct(&peer, &[addr])?;
+        self.deny_blocked(&peer)?;
         Ok(dummy::ConnectionHandler)
     }
 
@@ -529,8 +508,7 @@ impl NetworkBehaviour for Announce {
         addresses.retain(|addr| {
             let dns = addr.iter().any(|protocol| matches!(protocol, Protocol::Dns(_) | Protocol::Dns4(_) | Protocol::Dns6(_) | Protocol::Dnsaddr(_)));
             let dns_allowed = !dns
-                || peer.is_some_and(|peer| self.dns_peers.contains(&peer))
-                || matches!(conn_source(addr), ConnSource::Relay(relay) if self.dns_peers.contains(&relay));
+                || peer.is_some_and(|peer| self.dns_peers.contains(&peer));
             dns_allowed && crate::addr_scope(addr) == crate::Scope::Public
         });
         if let Some(peer) = peer {
@@ -633,26 +611,7 @@ mod tests {
     }
 
     #[test]
-    fn relayed_connections_share_a_relay_source_bucket() {
-        let relay = PeerId::random();
-        let first: Multiaddr = format!(
-            "/ip4/8.8.8.8/tcp/4001/p2p/{relay}/p2p-circuit/p2p/{}",
-            PeerId::random()
-        )
-        .parse()
-        .unwrap();
-        let second: Multiaddr = format!(
-            "/ip4/8.8.8.8/tcp/4001/p2p/{relay}/p2p-circuit/p2p/{}",
-            PeerId::random()
-        )
-        .parse()
-        .unwrap();
-        assert_eq!(conn_source(&first), conn_source(&second));
-        assert_eq!(conn_source(&first), ConnSource::Relay(relay));
-    }
-
-    #[test]
-    fn discovery_candidates_survive_empty_updates_and_exclude_relay_ips() {
+    fn discovery_candidates_survive_empty_updates_and_exclude_private_ips() {
         let me = PeerId::random();
         let peer = PeerId::random();
         let inner = kad::Behaviour::with_config(
@@ -663,13 +622,9 @@ mod tests {
         let mut announce = Announce::new(inner, HashSet::new());
         let public: Multiaddr = "/ip4/186.205.17.114/udp/50127/quic-v1".parse().unwrap();
         let private: Multiaddr = "/ip4/192.168.0.11/tcp/63014".parse().unwrap();
-        let relay: Multiaddr = format!(
-            "/ip4/132.226.115.3/tcp/4001/p2p/{}/p2p-circuit/p2p/{peer}",
-            PeerId::random()
-        ).parse().unwrap();
         announce.handle_pending_outbound_connection(
             ConnectionId::new_unchecked(1), Some(peer),
-            &[relay, private, public.clone()], Endpoint::Dialer,
+            &[private, public.clone()], Endpoint::Dialer,
         ).unwrap();
         assert_eq!(announce.dial_candidates(&peer), &[public.clone()]);
         announce.handle_pending_outbound_connection(

@@ -1,5 +1,5 @@
 use futures::StreamExt;
-use cosmos_net::{Config, ConnLimits, Event, Keypair, Multiaddr, Node, PeerId, RelayLimits, is_relayed};
+use cosmos_net::{Config, ConnLimits, Event, Keypair, Multiaddr, Node, PeerId};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -14,7 +14,6 @@ fn base() -> Config {
         ],
         mdns: false,
         upnp: false,
-        auto_relay: false,
         ..Config::default()
     }
 }
@@ -23,12 +22,8 @@ async fn tcp_addr(n: &Node) -> Multiaddr {
     n.listen_addrs()
         .await
         .into_iter()
-        .find(|a| a.to_string().contains("/tcp/") && !is_relayed(a))
+        .find(|a| a.to_string().contains("/tcp/"))
         .expect("tcp listen addr")
-}
-
-async fn relayed_addr(n: &Node) -> Option<Multiaddr> {
-    n.listen_addrs().await.into_iter().find(is_relayed)
 }
 
 async fn server(n: &Node) -> Multiaddr {
@@ -37,7 +32,6 @@ async fn server(n: &Node) -> Multiaddr {
         .listen_addrs()
         .await
         .into_iter()
-        .filter(|addr| !is_relayed(addr))
     {
         n.add_external_addr(addr);
     }
@@ -233,53 +227,8 @@ async fn udp_echo_through_direct_tunnel() {
     assert_eq!(rtts.len(), 100);
     let conns = a.connections(b.peer_id()).await;
     println!("A->B connections: {conns:?}");
-    assert!(
-        conns.iter().any(|x| !is_relayed(x)),
-        "expected a direct connection"
-    );
-    assert!(!a.tunnels().await[0].relayed);
+    assert!(!conns.is_empty(), "expected a direct connection");
     report("direct tunnel", rtts);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn udp_echo_through_relay_c() {
-    let echo = echo_server().await;
-    let c = Node::start(base()).await.unwrap();
-    let c_tcp = server(&c).await;
-    let direct_off = Config {
-        listen: vec![],
-        hole_punch: false,
-        bootstrap: vec![c_tcp.clone()],
-        ..base()
-    };
-    let b = Node::start(Config {
-        relays: vec![c_tcp.clone()],
-        ..direct_off.clone()
-    })
-    .await
-    .unwrap();
-    c.allow_peer(b.peer_id());
-    b.set_tunnel_target(echo);
-    wait_for("B relay reservation", 20, || async {
-        relayed_addr(&b).await.is_some()
-    })
-    .await;
-    println!("B listens on {:?}", b.listen_addrs().await);
-
-    let a = Node::start(direct_off).await.unwrap();
-    c.allow_peer(a.peer_id());
-    b.allow_peer(a.peer_id());
-    let port = open_with_retry(&a, b.peer_id()).await;
-    let rtts = echo_rounds(port, 100).await;
-    assert_eq!(rtts.len(), 100);
-    let conns = a.connections(b.peer_id()).await;
-    println!("A->B connections: {conns:?}");
-    assert!(
-        !conns.is_empty() && conns.iter().all(is_relayed),
-        "expected only relayed connections, got {conns:?}"
-    );
-    assert!(a.tunnels().await[0].relayed);
-    report("relayed tunnel via C", rtts);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -302,298 +251,6 @@ async fn gossip_subscribe_receives_signed_record() {
     };
     assert_eq!(got.publisher, a.peer_id());
     assert_eq!(got.data, b"room-advert");
-}
-
-fn record_events(n: &Node) -> std::sync::Arc<std::sync::Mutex<Vec<(Instant, Event)>>> {
-    let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let mut ev = Box::pin(n.events());
-    let l = log.clone();
-    tokio::spawn(async move {
-        while let Some(e) = ev.next().await {
-            l.lock().unwrap().push((Instant::now(), e));
-        }
-    });
-    log
-}
-
-async fn trusted_pair(echo: SocketAddr, cfg: Config) -> (Node, Node, Node) {
-    let c = Node::start(base()).await.unwrap();
-    let c_tcp = server(&c).await;
-    let b = Node::start(Config {
-        relays: vec![c_tcp.clone()],
-        tunnel_target: Some(echo),
-        ..cfg.clone()
-    })
-    .await
-    .unwrap();
-    c.allow_peer(b.peer_id());
-    wait_for("B relay reservation", 20, || async {
-        relayed_addr(&b).await.is_some()
-    })
-    .await;
-    let a = Node::start(Config {
-        relays: vec![c_tcp],
-        ..cfg
-    })
-    .await
-    .unwrap();
-    c.allow_peer(a.peer_id());
-    server(&a).await;
-    server(&b).await;
-    (c, a, b)
-}
-
-async fn via_circuit(a: &Node, b: &Node) {
-    let start = Instant::now();
-    loop {
-        let _ = a
-            .dial(relayed_addr(b).await.expect("B lost its reservation"))
-            .await;
-        let until = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < until {
-            if !a.connections(b.peer_id()).await.is_empty() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        assert!(
-            start.elapsed() < Duration::from_secs(20),
-            "timed out waiting for relayed A->B connection"
-        );
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn tunnel_prefers_direct_over_trusted_relay() {
-    let echo = echo_server().await;
-    let (_c, a, b) = trusted_pair(echo, base()).await;
-    let (la, lb) = (record_events(&a), record_events(&b));
-    b.allow_peer(a.peer_id());
-    via_circuit(&a, &b).await;
-    let t0 = Instant::now();
-    a.allow_peer(b.peer_id());
-    let port = timeout(Duration::from_secs(20), a.open_tunnel(b.peer_id()))
-        .await
-        .expect("open_tunnel hung")
-        .expect("open_tunnel");
-    println!("direct tunnel up after {:?}", t0.elapsed());
-    let t = a.tunnels().await;
-    assert!(
-        t.len() == 1 && !t[0].relayed,
-        "tunnel must start direct: {t:?}"
-    );
-    echo_rounds(port, 50).await;
-    assert!(b.tunnels().await.iter().all(|t| !t.relayed));
-    for (who, log) in [("A", &la), ("B", &lb)] {
-        for (_, e) in log.lock().unwrap().iter() {
-            assert!(
-                !matches!(
-                    e,
-                    Event::TunnelPath { relayed: true, .. } | Event::TunnelFallback { .. }
-                ),
-                "{who}: relay carried tunnel data: {e:?}"
-            );
-        }
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn tunnel_falls_back_to_trusted_relay_when_direct_blocked() {
-    let echo = echo_server().await;
-    let cfg = Config {
-        relay_after: Duration::from_secs(40),
-        ..base()
-    };
-    let (_c, a, b) = trusted_pair(echo, cfg).await;
-    a.block_direct(b.peer_id(), true);
-    b.block_direct(a.peer_id(), true);
-    let la = record_events(&a);
-    b.allow_peer(a.peer_id());
-    via_circuit(&a, &b).await;
-    let t0 = Instant::now();
-    a.allow_peer(b.peer_id());
-    let port = timeout(Duration::from_secs(50), a.open_tunnel(b.peer_id()))
-        .await
-        .expect("open_tunnel hung")
-        .expect("open_tunnel");
-    let took = t0.elapsed();
-    let seen: Vec<String> = la
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|(at, e)| {
-            format!(
-                "{:.1}s {e:?}",
-                at.saturating_duration_since(t0).as_secs_f32()
-            )
-        })
-        .collect();
-    println!("relay fallback after {took:?}\n{seen:#?}");
-    assert!(
-        took <= Duration::from_secs(41),
-        "fallback not bounded: {took:?}"
-    );
-    let t = a.tunnels().await;
-    assert!(t.len() == 1 && t[0].relayed, "{t:?}");
-    let rtts = echo_rounds(port, 50).await;
-    assert_eq!(rtts.len(), 50);
-    let log = la.lock().unwrap();
-    assert!(
-        log.iter()
-            .all(|(_, e)| !matches!(e, Event::TunnelPath { relayed: false, .. }))
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn tunnel_migrates_relayed_to_direct_keeping_port() {
-    let echo = echo_server().await;
-    let cfg = Config {
-        hole_punch: false,
-        direct_retry_every: Duration::from_secs(2),
-        ..base()
-    };
-    let (c, a, b) = trusted_pair(echo, cfg).await;
-    a.block_direct(b.peer_id(), true);
-    b.block_direct(a.peer_id(), true);
-    b.allow_peer(a.peer_id());
-    via_circuit(&a, &b).await;
-    let t0 = Instant::now();
-    a.allow_peer(b.peer_id());
-    let port = timeout(Duration::from_secs(20), a.open_tunnel(b.peer_id()))
-        .await
-        .expect("open_tunnel hung")
-        .expect("open_tunnel");
-    println!("relay fallback after {:?}", t0.elapsed());
-    let t = a.tunnels().await;
-    assert!(
-        t.len() == 1 && t[0].relayed,
-        "tunnel should start relayed: {t:?}"
-    );
-    assert!(a.connections(b.peer_id()).await.iter().all(is_relayed));
-    echo_rounds(port, 20).await;
-
-    let during = tokio::spawn(echo_rounds_paced(port, 1500, Duration::from_millis(3)));
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    a.block_direct(b.peer_id(), false);
-    b.block_direct(a.peer_id(), false);
-    let start = Instant::now();
-    loop {
-        let ta = a.tunnels().await;
-        let tb = b.tunnels().await;
-        if ta.len() == 1 && !ta[0].relayed && tb.len() == 1 && !tb[0].relayed {
-            break;
-        }
-        if start.elapsed() > Duration::from_secs(15) {
-            panic!(
-                "no migration: a<b={} ta={ta:?} tb={tb:?} ab={:?} ba={:?}",
-                a.peer_id() < b.peer_id(),
-                a.connections(b.peer_id()).await,
-                b.connections(a.peer_id()).await
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    println!("migrated to direct {:?} after unblock", start.elapsed());
-    assert_eq!(
-        a.tunnels().await[0].local,
-        port,
-        "local port changed on migration"
-    );
-    let rtts = during.await.expect("an echo was lost during migration");
-    assert_eq!(rtts.len(), 1500);
-
-    drop(c);
-    wait_for("relayed connection gone", 15, || async {
-        let cs = a.connections(b.peer_id()).await;
-        !cs.is_empty() && cs.iter().all(|x| !is_relayed(x))
-    })
-    .await;
-    report(
-        "after relay->direct migration, relay killed",
-        echo_rounds(port, 50).await,
-    );
-    assert_eq!(a.tunnels().await[0].local, port);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn relay_restart_restores_reservation_and_reachability() {
-    let echo = echo_server().await;
-    let kp = Keypair::generate_ed25519();
-    let c = Node::start(Config {
-        keypair: Some(kp.clone()),
-        ..base()
-    })
-    .await
-    .unwrap();
-    let c_tcp = server(&c).await;
-    let c_base: Multiaddr = c_tcp
-        .to_string()
-        .split("/p2p/")
-        .next()
-        .unwrap()
-        .parse()
-        .unwrap();
-    let b = Node::start(Config {
-        listen: vec![],
-        hole_punch: false,
-        relays: vec![c_tcp.clone()],
-        tunnel_target: Some(echo),
-        ..base()
-    })
-    .await
-    .unwrap();
-    c.allow_peer(b.peer_id());
-    wait_for("first reservation", 20, || async {
-        relayed_addr(&b).await.is_some()
-    })
-    .await;
-
-    drop(c);
-    wait_for("reservation lost", 15, || async {
-        relayed_addr(&b).await.is_none()
-    })
-    .await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let start = Instant::now();
-    let c2 = loop {
-        match Node::start(Config {
-            keypair: Some(kp.clone()),
-            listen: vec![c_base.clone()],
-            ..base()
-        })
-        .await
-        {
-            Ok(n) => break n,
-            Err(e) => {
-                assert!(
-                    start.elapsed() < Duration::from_secs(10),
-                    "relay restart failed: {e}"
-                );
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-        }
-    };
-    c2.add_external_addr(c_tcp.clone());
-    c2.allow_peer(b.peer_id());
-    wait_for("reservation regained after relay restart", 40, || async {
-        relayed_addr(&b).await.is_some()
-    })
-    .await;
-
-    let a = Node::start(Config {
-        listen: vec![],
-        hole_punch: false,
-        relays: vec![c_tcp.clone()],
-        ..base()
-    })
-    .await
-    .unwrap();
-    c2.allow_peer(a.peer_id());
-    b.allow_peer(a.peer_id());
-    a.dial(relayed_addr(&b).await.unwrap()).await.unwrap();
-    let port = open_with_retry(&a, b.peer_id()).await;
-    echo_rounds(port, 20).await;
-    assert!(a.connections(b.peer_id()).await.iter().all(is_relayed));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -778,91 +435,6 @@ async fn failed_side_dial_does_not_fail_pending_connect() {
     assert!(!a.connections(b.peer_id()).await.is_empty());
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn relay_byte_cap_cuts_circuit_and_tunnel_recovers_on_same_port() {
-    let echo = echo_server().await;
-    let limits = RelayLimits {
-        max_circuit_bytes: 64 * 1024,
-        ..RelayLimits::default()
-    };
-    let c = Node::start(Config {
-        relay_limits: limits,
-        ..base()
-    })
-    .await
-    .unwrap();
-    let c_tcp = server(&c).await;
-    let b = Node::start(Config {
-        listen: vec![],
-        hole_punch: false,
-        relays: vec![c_tcp.clone()],
-        tunnel_target: Some(echo),
-        ..base()
-    })
-    .await
-    .unwrap();
-    c.allow_peer(b.peer_id());
-    wait_for("B relay reservation", 20, || async {
-        relayed_addr(&b).await.is_some()
-    })
-    .await;
-    let a = Node::start(Config {
-        listen: vec![],
-        hole_punch: false,
-        relays: vec![c_tcp],
-        ..base()
-    })
-    .await
-    .unwrap();
-    c.allow_peer(a.peer_id());
-    b.allow_peer(a.peer_id());
-    let mut ev = Box::pin(a.events());
-    a.dial(relayed_addr(&b).await.unwrap()).await.unwrap();
-    let port = open_with_retry(&a, b.peer_id()).await;
-
-    let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let mut buf = vec![0u8; 65535];
-    let (mut ok, mut lost) = (0, 0);
-    for i in 0..100u32 {
-        let mut msg = i.to_be_bytes().to_vec();
-        msg.resize(1000, (i % 251) as u8);
-        s.send_to(&msg, port).await.unwrap();
-        loop {
-            match timeout(Duration::from_secs(3), s.recv_from(&mut buf)).await {
-                Ok(Ok((n, _))) if buf[..n] == msg[..] => {
-                    ok += 1;
-                    break;
-                }
-                Ok(_) => continue,
-                Err(_) => {
-                    lost += 1;
-                    break;
-                }
-            }
-        }
-    }
-    let mut circuits = 0;
-    while let Ok(Some(e)) = timeout(Duration::from_millis(10), ev.next()).await {
-        if matches!(e, Event::Connected { peer, relayed: true, .. } if peer == b.peer_id()) {
-            circuits += 1;
-        }
-    }
-    println!("byte cap: ok={ok} lost={lost} relayed connections={circuits}");
-    assert!(
-        circuits >= 2,
-        "byte cap never cut the circuit ({circuits} circuits)"
-    );
-    assert!(
-        ok >= 90,
-        "tunnel did not recover after circuit cuts: ok={ok} lost={lost}"
-    );
-    assert_eq!(
-        a.tunnels().await[0].local,
-        port,
-        "port changed across circuit cuts"
-    );
-}
-
 async fn next_event<T>(
     ev: &mut (impl futures::Stream<Item = Event> + Unpin),
     secs: u64,
@@ -1020,26 +592,6 @@ async fn serve_list(body: String) -> String {
         }
     });
     url
-}
-
-#[tokio::test]
-async fn relay_only_rejects_direct_dials_and_binds_loopback() {
-    let relay_only = Node::start(Config {
-        relay_only: true,
-        relays: vec![],
-        ..base()
-    })
-    .await
-    .unwrap();
-    let direct_peer = Node::start(base()).await.unwrap();
-    assert!(relay_only.dial(tcp_addr(&direct_peer).await).await.is_err());
-    assert!(
-        relay_only
-            .listen_addrs()
-            .await
-            .iter()
-            .all(|addr| addr.to_string().starts_with("/ip4/127.0.0.1/"))
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

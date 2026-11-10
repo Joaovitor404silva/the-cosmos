@@ -3,7 +3,6 @@ mod kadnet;
 mod pipe;
 mod portguess;
 mod record;
-mod relaysrv;
 mod rpc;
 mod store;
 mod tunnel;
@@ -17,11 +16,9 @@ pub use rpc::{RpcLimits, RpcRequest, RpcStats};
 use anyhow::anyhow;
 use futures::{AsyncReadExt, AsyncWriteExt, Stream, StreamExt};
 use libp2p::{
-    StreamProtocol, Swarm, autonat, connection_limits,
-    core::transport::ListenerId,
-    dcutr, gossipsub, identify, kad, mdns,
+    StreamProtocol, Swarm, autonat, connection_limits, gossipsub, identify, kad, mdns,
     multiaddr::Protocol,
-    noise, ping, relay,
+    noise, ping,
     swarm::{
         ConnectionId, NetworkBehaviour, SwarmEvent,
         behaviour::toggle::Toggle,
@@ -32,57 +29,24 @@ use libp2p::{
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::Instant;
 
-#[derive(Clone, Debug)]
-pub struct RelayLimits {
-    pub max_reservations: usize,
-    pub max_reservations_per_peer: usize,
-    pub max_circuits: usize,
-    pub max_circuits_per_peer: usize,
-    pub max_circuit_duration: Duration,
-    pub max_circuit_bytes: u64,
-    pub per_peer_per_minute: u32,
-    pub per_ip_per_minute: u32,
-}
-
-impl Default for RelayLimits {
-    fn default() -> Self {
-        Self {
-            max_reservations: 16,
-            max_reservations_per_peer: 1,
-            max_circuits: 32,
-            max_circuits_per_peer: 8,
-            max_circuit_duration: Duration::from_secs(10 * 60),
-            max_circuit_bytes: 64 << 20,
-            per_peer_per_minute: 120,
-            per_ip_per_minute: 240,
-        }
-    }
-}
 
 #[derive(Clone, Debug)]
 pub struct Config {
     pub keypair: Option<Keypair>,
     pub listen: Vec<Multiaddr>,
     pub bootstrap: Vec<Multiaddr>,
-    pub relays: Vec<Multiaddr>,
-    pub auto_relay: bool,
     pub mdns: bool,
     pub upnp: bool,
     pub hole_punch: bool,
-    pub relay_server: bool,
-    pub relay_open: bool,
-    pub relay_limits: RelayLimits,
     pub tunnel_target: Option<SocketAddr>,
     pub tunnel_allowlist: Option<HashSet<PeerId>>,
     pub tunnel_blocklist: HashSet<PeerId>,
-    pub relay_only: bool,
     pub max_tunnels: usize,
     pub max_streams_per_peer: usize,
     pub tunnel_reconnect_window: Duration,
@@ -97,10 +61,6 @@ pub struct Config {
     pub peer_cache: Option<PathBuf>,
     pub limits: ConnLimits,
     pub rpc: RpcLimits,
-    pub public_relays: usize,
-    pub direct_grace: Duration,
-    pub relay_after: Duration,
-    pub direct_retry_every: Duration,
     pub port_guess: bool,
     pub port_guess_plan: portguess::Plan,
 }
@@ -116,18 +76,12 @@ impl Default for Config {
                 "/ip6/::/tcp/0".parse().unwrap(),
             ],
             bootstrap: vec![],
-            relays: vec![],
-            auto_relay: true,
             mdns: true,
             upnp: true,
             hole_punch: true,
-            relay_server: true,
-            relay_open: false,
-            relay_limits: RelayLimits::default(),
             tunnel_target: None,
             tunnel_allowlist: None,
             tunnel_blocklist: HashSet::new(),
-            relay_only: false,
             max_tunnels: 16,
             max_streams_per_peer: 4,
             tunnel_reconnect_window: Duration::from_secs(30),
@@ -142,10 +96,6 @@ impl Default for Config {
             peer_cache: None,
             limits: ConnLimits::default(),
             rpc: RpcLimits::default(),
-            public_relays: 2,
-            direct_grace: Duration::from_secs(15),
-            relay_after: RELAY_AFTER,
-            direct_retry_every: BG_DIRECT_EVERY,
             port_guess: false,
             port_guess_plan: portguess::Plan::default(),
         }
@@ -158,20 +108,12 @@ pub enum Event {
     Connected {
         peer: PeerId,
         addr: Multiaddr,
-        relayed: bool,
     },
     Disconnected {
         peer: PeerId,
     },
     Reachability {
         public: bool,
-    },
-    RelayReservation {
-        relay: PeerId,
-    },
-    HolePunch {
-        peer: PeerId,
-        ok: bool,
     },
     TunnelAccepted {
         peer: PeerId,
@@ -180,24 +122,12 @@ pub enum Event {
     TunnelPath {
         peer: PeerId,
         local: SocketAddr,
-        relayed: bool,
+        quic: bool,
     },
     TunnelClosed {
         peer: PeerId,
         local: SocketAddr,
         reason: String,
-    },
-    TunnelNoDirect {
-        peer: PeerId,
-        local: SocketAddr,
-    },
-    TunnelFallback {
-        peer: PeerId,
-        local: SocketAddr,
-    },
-    PortGuess {
-        peer: PeerId,
-        ok: bool,
     },
     UpnpMapped {
         addr: Multiaddr,
@@ -239,7 +169,6 @@ pub enum Event {
 pub struct TunnelInfo {
     pub peer: PeerId,
     pub local: SocketAddr,
-    pub relayed: bool,
     pub streams: usize,
 }
 
@@ -247,9 +176,6 @@ pub struct TunnelInfo {
 struct Behaviour {
     limits: connection_limits::Behaviour,
     ip_limit: discovery::IpLimit,
-    relay_client: relay::client::Behaviour,
-    relay_server: Toggle<relaysrv::RelayServer>,
-    dcutr: Toggle<dcutr::Behaviour>,
     identify: identify::Behaviour,
     ping: ping::Behaviour,
     kad: kadnet::Kad,
@@ -261,7 +187,6 @@ struct Behaviour {
     pipe: pipe::Behaviour,
     rpc: pipe::Behaviour,
     rec: pipe::Behaviour,
-    guess: pipe::Behaviour,
 }
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(15);
@@ -366,23 +291,6 @@ enum Inner {
     },
     Note(tunnel::Note),
     Fallback(Result<Vec<Multiaddr>, String>),
-    Guessed {
-        peer: PeerId,
-        run: u64,
-        result: Result<portguess::Win, String>,
-    },
-    GuessDial {
-        peer: PeerId,
-        addr: Multiaddr,
-    },
-}
-
-struct Guess {
-    run: u64,
-    initiator: bool,
-    since: Instant,
-    listener: Option<ListenerId>,
-    outcome: Option<bool>,
 }
 
 enum Pending {
@@ -429,84 +337,16 @@ struct Tun {
     streams: HashMap<u64, (u8, ConnectionId)>,
     pending: usize,
     opening: Option<u64>,
-    opener: bool,
-    relay_ok: bool,
-    bg_next: Instant,
     waiters: Vec<Reply<SocketAddr>>,
     retry_at: Instant,
     backoff: Duration,
     down_since: Instant,
     ever_up: bool,
-    path: Option<bool>,
-    nodirect_since: Option<Instant>,
-    nodirect_sent: bool,
-    circuit_dialed: Option<Instant>,
-    stale_relayed: Vec<ConnectionId>,
-    punch: PunchRetry,
+    path: Option<u8>,
 }
-
-const RELAY_AFTER: Duration = Duration::from_secs(40);
-const NO_PUNCH_WAIT: Duration = Duration::from_secs(2);
-const PUNCH_RESULT_WAIT: Duration = Duration::from_secs(4);
-const BG_DIRECT_EVERY: Duration = Duration::from_secs(60);
-const SPARE_RELAYED_LINGER: Duration = Duration::from_secs(20);
-const GUESS_DIAL_DELAY: Duration = Duration::from_millis(300);
-const GUESS_DIAL_GRACE: Duration = Duration::from_secs(6);
-const GUESS_RETRY_AFTER: Duration = Duration::from_secs(300);
-const GUESS_OFFER_TIMEOUT: Duration = Duration::from_secs(5);
-
-fn guess_due(guess: Option<&Guess>, now: Instant) -> bool {
-    guess.is_none_or(|g| {
-        g.outcome == Some(false) && now.duration_since(g.since) >= GUESS_RETRY_AFTER
-    })
-}
-
-const PUNCH_BACKOFF: [Duration; 3] = [
-    Duration::from_secs(2),
-    Duration::from_secs(4),
-    Duration::from_secs(6),
-];
-
-#[derive(Debug, PartialEq, Eq)]
-enum PunchStep {
-    Wait,
-    Retry,
-    Exhausted,
-}
-
-#[derive(Default)]
-struct PunchRetry {
-    tries: usize,
-    next: Option<Instant>,
-}
-
-impl PunchRetry {
-    #[cfg(test)]
-    fn active(&self) -> bool {
-        self.next.is_some()
-    }
-
-    fn step(&mut self, now: Instant) -> PunchStep {
-        let next = *self.next.get_or_insert(now + PUNCH_BACKOFF[0]);
-        if now < next {
-            return PunchStep::Wait;
-        }
-        if self.tries >= PUNCH_BACKOFF.len() {
-            return PunchStep::Exhausted;
-        }
-        self.tries += 1;
-        self.next = Some(now + PUNCH_BACKOFF[self.tries.min(PUNCH_BACKOFF.len() - 1)]);
-        PunchStep::Retry
-    }
-}
-
 impl Tun {
     fn top(&self) -> Option<u8> {
         self.streams.values().map(|(r, _)| *r).max()
-    }
-
-    fn carries(&self, conn: &ConnectionId) -> bool {
-        self.streams.values().any(|(_, c)| c == conn)
     }
 }
 
@@ -522,7 +362,7 @@ pub struct Node {
     targets: tunnel::SharedTargets,
     rpc_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<RpcRequest>>>>,
     gate: Arc<rpc::Gate>,
-    blocked: RelayPeers,
+    blocked: PeerSet,
     permanently_blocked: HashSet<PeerId>,
 }
 
@@ -552,22 +392,12 @@ fn split_peer(addr: &Multiaddr) -> Option<(PeerId, Multiaddr)> {
     }
 }
 
-pub fn is_relayed(addr: &Multiaddr) -> bool {
-    addr.iter().any(|p| p == Protocol::P2pCircuit)
-}
-
 fn is_quic(addr: &Multiaddr) -> bool {
     addr.iter().any(|p| matches!(p, Protocol::QuicV1))
 }
 
 fn rank(addr: &Multiaddr) -> u8 {
-    if is_relayed(addr) {
-        1
-    } else if is_quic(addr) {
-        3
-    } else {
-        2
-    }
+    if is_quic(addr) { 3 } else { 2 }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -660,13 +490,8 @@ fn ip4_of(a: &Multiaddr) -> Option<Ipv4Addr> {
 fn global_ip4_from<'a>(addrs: impl IntoIterator<Item = &'a Multiaddr>) -> Option<Ipv4Addr> {
     addrs
         .into_iter()
-        .filter(|addr| !is_relayed(addr))
         .filter_map(ip4_of)
         .find(|ip| global_ip4(ip))
-}
-
-fn peer_guess_ip4(direct: Option<Ipv4Addr>, advertised: &[Multiaddr]) -> Option<Ipv4Addr> {
-    direct.or_else(|| global_ip4_from(advertised))
 }
 
 fn addr_scope(a: &Multiaddr) -> Scope {
@@ -697,69 +522,22 @@ fn identify_config(key: libp2p::identity::PublicKey) -> identify::Config {
 }
 
 pub fn is_public_addr(addr: &Multiaddr) -> bool {
-    !is_relayed(addr)
-        && addr_scope(addr) == Scope::Public
+    addr_scope(addr) == Scope::Public
         && addr
             .iter()
             .any(|protocol| matches!(protocol, Protocol::Ip4(_) | Protocol::Ip6(_)))
         && !is_dns(addr)
 }
 
-fn relay_config(
-    l: &RelayLimits,
-    open: bool,
-    peers: RelayPeers,
-    _claimed: RelayPeers,
-) -> relay::Config {
-    let minute = Duration::from_secs(60);
-    let per_peer = NonZeroU32::new(l.per_peer_per_minute.max(1)).unwrap();
-    let per_ip = NonZeroU32::new(l.per_ip_per_minute.max(1)).unwrap();
-    let mut c = relay::Config {
-        max_reservations: l.max_reservations,
-        max_reservations_per_peer: l.max_reservations_per_peer,
-        max_circuits: l.max_circuits,
-        max_circuits_per_peer: l.max_circuits_per_peer,
-        max_circuit_duration: l.max_circuit_duration,
-        max_circuit_bytes: l.max_circuit_bytes,
-        ..Default::default()
-    };
-    c.reservation_rate_limiters.clear();
-    c.circuit_src_rate_limiters.clear();
-    c = c
-        .reservation_rate_per_peer(per_peer, minute)
-        .reservation_rate_per_ip(per_ip, minute)
-        .circuit_src_per_peer(per_peer, minute)
-        .circuit_src_per_ip(per_ip, minute);
-    if !open {
-        let r = peers.clone();
-        c.reservation_rate_limiters
-            .push(Box::new(move |p: PeerId, _: &Multiaddr, _| {
-                r.lock().unwrap().contains(&p)
-            }));
-        c.circuit_src_rate_limiters
-            .push(Box::new(move |p: PeerId, _: &Multiaddr, _| {
-                peers.lock().unwrap().contains(&p)
-            }));
-    }
-    c
-}
-
-type RelayPeers = Arc<Mutex<HashSet<PeerId>>>;
+type PeerSet = Arc<Mutex<HashSet<PeerId>>>;
 type Topics = Arc<Mutex<HashMap<String, broadcast::Sender<Record>>>>;
 type Own = Arc<Mutex<HashMap<String, Vec<u8>>>>;
 
-fn build_swarm(
-    cfg: &Config,
-    keypair: Keypair,
-    relay_peers: RelayPeers,
-    claimed: RelayPeers,
-    blocked: RelayPeers,
-) -> anyhow::Result<Swarm<Behaviour>> {
+fn build_swarm(cfg: &Config, keypair: Keypair, blocked: PeerSet) -> anyhow::Result<Swarm<Behaviour>> {
     let ttl = cfg.record_ttl;
     let dns_peers: HashSet<PeerId> = cfg
         .bootstrap
         .iter()
-        .chain(cfg.relays.iter())
         .filter_map(|addr| split_peer(addr).map(|(peer, _)| peer))
         .collect();
     let cfg = cfg.clone();
@@ -772,8 +550,7 @@ fn build_swarm(
         )?
         .with_quic()
         .with_dns()?
-        .with_relay_client(noise::Config::new, yamux::Config::default)?
-        .with_behaviour(|key, relay_client| {
+        .with_behaviour(|key| {
             let id = key.public().to_peer_id();
             let mut kcfg = kad::Config::new(KAD_PROTO);
             kcfg.set_record_ttl(Some(ttl));
@@ -790,7 +567,6 @@ fn build_swarm(
             let mut kad = kadnet::Kad::new(
                 kad::Behaviour::with_config(id, store::Store::new(id, REC_MAX), kcfg),
                 local_only,
-                cfg.relay_only,
                 dns_peers.clone(),
             );
             kad.set_mode(Some(kad::Mode::Server));
@@ -801,17 +577,6 @@ fn build_swarm(
                 gossipsub::MessageAuthenticity::Signed(key.clone()),
                 gcfg,
             )?;
-            let relay_server = cfg.relay_server.then(|| {
-                relaysrv::RelayServer::new(relay::Behaviour::new(
-                    id,
-                    relay_config(
-                        &cfg.relay_limits,
-                        cfg.relay_open,
-                        relay_peers.clone(),
-                        claimed.clone(),
-                    ),
-                ))
-            });
             let mdns = if cfg.mdns {
                 Some(mdns::tokio::Behaviour::new(mdns::Config::default(), id)?)
             } else {
@@ -835,9 +600,6 @@ fn build_swarm(
                 limits: connection_limits::Behaviour::new(cfg.limits.libp2p()),
                 ip_limit: discovery::IpLimit::new(cfg.limits.max_inbound_per_ip, blocked),
                 ipfs: ipfs.into(),
-                relay_client,
-                relay_server: relay_server.into(),
-                dcutr: cfg.hole_punch.then(|| dcutr::Behaviour::new(id)).into(),
                 identify: identify::Behaviour::new(identify_config(key.public())),
                 ping: ping::Behaviour::default(),
                 kad,
@@ -848,7 +610,6 @@ fn build_swarm(
                 pipe: pipe::Behaviour::new(tunnel::PROTOCOL),
                 rpc: pipe::Behaviour::new(rpc::PROTO),
                 rec: pipe::Behaviour::new(REC_PROTO),
-                guess: pipe::Behaviour::new(portguess::PROTO),
             })
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(120)))
@@ -857,39 +618,14 @@ fn build_swarm(
 }
 
 impl Node {
-    pub async fn start(mut cfg: Config) -> anyhow::Result<Node> {
-        if cfg.relay_only {
-            let relays: HashSet<PeerId> = cfg
-                .relays
-                .iter()
-                .filter_map(|addr| split_peer(addr).map(|(peer, _)| peer))
-                .collect();
-            cfg.bootstrap
-                .retain(|addr| split_peer(addr).is_some_and(|(peer, _)| relays.contains(&peer)));
-            cfg.ipfs = false;
-            cfg.mdns = false;
-            cfg.upnp = false;
-            cfg.hole_punch = false;
-            cfg.port_guess = false;
-            cfg.relay_server = false;
-            cfg.public_relays = 0;
-            cfg.listen = vec!["/ip4/127.0.0.1/tcp/0".parse()?];
-        }
+    pub async fn start(cfg: Config) -> anyhow::Result<Node> {
         let keypair = cfg
             .keypair
             .clone()
             .unwrap_or_else(Keypair::generate_ed25519);
-        let relay_peers: RelayPeers = Arc::new(Mutex::new(HashSet::new()));
-        let bb_claimed: RelayPeers = Arc::new(Mutex::new(HashSet::new()));
         let permanently_blocked = cfg.tunnel_blocklist.clone();
-        let blocked: RelayPeers = Arc::new(Mutex::new(permanently_blocked.clone()));
-        let mut swarm = build_swarm(
-            &cfg,
-            keypair.clone(),
-            relay_peers.clone(),
-            bb_claimed.clone(),
-            blocked.clone(),
-        )?;
+        let blocked: PeerSet = Arc::new(Mutex::new(permanently_blocked.clone()));
+        let mut swarm = build_swarm(&cfg, keypair.clone(), blocked.clone())?;
         let peer_id = *swarm.local_peer_id();
         let mut waiting = HashSet::new();
         for a in &cfg.listen {
@@ -925,7 +661,7 @@ impl Node {
         }
         let now = Instant::now();
         let mut anchors = Vec::new();
-        for a in cfg.bootstrap.iter().chain(cfg.relays.iter()) {
+        for a in cfg.bootstrap.iter() {
             if let Some((p, base)) = split_peer(a) {
                 swarm.behaviour_mut().kad.add_address(&p, base);
                 if !anchors.iter().any(|x: &Anchor| x.peer == p) {
@@ -941,10 +677,6 @@ impl Node {
             }
         }
         let _ = swarm.behaviour_mut().kad.bootstrap();
-        relay_peers
-            .lock()
-            .unwrap()
-            .extend(anchors.iter().map(|a| a.peer));
 
         let mut seeds = HashMap::new();
         let cache = cfg.peer_cache.clone().map(discovery::PeerCache::load);
@@ -1009,9 +741,6 @@ impl Node {
             in_flight: HashMap::new(),
             conns: HashMap::new(),
             anchors,
-            relay_listeners: HashMap::new(),
-            relay_retry: HashMap::new(),
-            nat_private: false,
             mdns_peers: HashSet::new(),
             tunnels: HashMap::new(),
             allowed: HashSet::new(),
@@ -1021,24 +750,11 @@ impl Node {
             note_tx,
             rpc_tx,
             gate: gate.clone(),
-            conn_info: HashMap::new(),
-            reserved: HashSet::new(),
-            nat_public: false,
-            pub_candidates: Vec::new(),
-            pub_relays: HashMap::new(),
-            pub_retry: HashMap::new(),
-            pub_next: now,
-            peer_circuits: HashMap::new(),
-            peer_direct: HashMap::new(),
-            identify_dial_at: HashMap::new(),
-            punch_failed: HashSet::new(),
             cache,
             cache_saved: now,
             seeds,
             bb_peers: HashSet::new(),
             bb_good: HashSet::new(),
-            relay_peers,
-            bb_claimed,
             bb_bootstrap_at: now,
             fallback_at,
             ipfs_ready: false,
@@ -1046,9 +762,10 @@ impl Node {
             ipfs_next_lookup: now,
             ipfs_provided: None,
             ipfs_observed: Vec::new(),
+            peer_direct: HashMap::new(),
+            identify_dial_at: HashMap::new(),
             observed_votes: HashMap::new(),
             ipfs_found: HashSet::new(),
-            guesses: HashMap::new(),
             observed_ip4: None,
             upnp_mapped: false,
             upnp_failed: false,
@@ -1351,9 +1068,6 @@ struct EventLoop {
     in_flight: HashMap<PeerId, HashSet<ConnectionId>>,
     conns: HashMap<PeerId, HashMap<ConnectionId, Multiaddr>>,
     anchors: Vec<Anchor>,
-    relay_listeners: HashMap<PeerId, ListenerId>,
-    relay_retry: HashMap<PeerId, Instant>,
-    nat_private: bool,
     mdns_peers: HashSet<PeerId>,
     tunnels: HashMap<PeerId, Tun>,
     allowed: HashSet<PeerId>,
@@ -1363,24 +1077,11 @@ struct EventLoop {
     note_tx: mpsc::UnboundedSender<tunnel::Note>,
     rpc_tx: mpsc::UnboundedSender<RpcRequest>,
     gate: Arc<rpc::Gate>,
-    conn_info: HashMap<ConnectionId, ConnInfo>,
-    reserved: HashSet<PeerId>,
-    nat_public: bool,
-    pub_candidates: Vec<(PeerId, Multiaddr)>,
-    pub_relays: HashMap<PeerId, ListenerId>,
-    pub_retry: HashMap<PeerId, (Instant, Duration)>,
-    pub_next: Instant,
-    peer_circuits: HashMap<PeerId, Vec<Multiaddr>>,
-    peer_direct: HashMap<PeerId, Vec<Multiaddr>>,
-    identify_dial_at: HashMap<PeerId, Instant>,
-    punch_failed: HashSet<PeerId>,
     cache: Option<discovery::PeerCache>,
     cache_saved: Instant,
     seeds: HashMap<PeerId, &'static str>,
     bb_peers: HashSet<PeerId>,
     bb_good: HashSet<PeerId>,
-    relay_peers: RelayPeers,
-    bb_claimed: RelayPeers,
     bb_bootstrap_at: Instant,
     fallback_at: Option<Instant>,
     ipfs_ready: bool,
@@ -1388,63 +1089,31 @@ struct EventLoop {
     ipfs_next_lookup: Instant,
     ipfs_provided: Option<(Instant, Vec<Multiaddr>)>,
     ipfs_observed: Vec<Multiaddr>,
+    peer_direct: HashMap<PeerId, Vec<Multiaddr>>,
+    identify_dial_at: HashMap<PeerId, Instant>,
     observed_votes: HashMap<Multiaddr, HashSet<IpAddr>>,
     ipfs_found: HashSet<PeerId>,
-    guesses: HashMap<PeerId, Guess>,
     observed_ip4: Option<Ipv4Addr>,
     upnp_mapped: bool,
     upnp_failed: bool,
 }
 
-struct ConnInfo {
-    relay: Option<PeerId>,
-    dialer: bool,
-    since: Instant,
-}
-
-const PUBLIC_RELAY_CANDIDATES: usize = 32;
-const PUBLIC_RELAY_PACE: Duration = Duration::from_secs(5);
-const PUBLIC_RELAY_BACKOFF: Duration = Duration::from_secs(30);
-const PUBLIC_RELAY_BACKOFF_MAX: Duration = Duration::from_secs(30 * 60);
-const PUBLIC_CIRCUIT_LINGER: Duration = Duration::from_secs(2);
-const DIRECT_WAIT_TICK: Duration = Duration::from_millis(250);
-const MAX_DIRECT_DIAL: usize = 8;
-
-fn circuit_relay(addr: &Multiaddr) -> Option<PeerId> {
-    let mut last = None;
-    for p in addr.iter() {
-        match p {
-            Protocol::P2p(id) => last = Some(id),
-            Protocol::P2pCircuit => return last,
-            _ => {}
-        }
-    }
-    None
-}
-
 pub fn network_source_bucket(peer: PeerId, addrs: &[Multiaddr]) -> String {
     for addr in addrs {
-        if !is_relayed(addr) {
-            if let Some(ip) = discovery::ip_of(addr) {
-                return match ip {
-                    IpAddr::V4(ip) => {
-                        let [a, b, c, _] = ip.octets();
-                        format!("net4:{a}.{b}.{c}.0/24")
-                    }
-                    IpAddr::V6(ip) => {
-                        let segments = ip.segments();
-                        format!(
-                            "net6:{:x}:{:x}:{:x}:{:x}::/64",
-                            segments[0], segments[1], segments[2], segments[3]
-                        )
-                    }
-                };
-            }
-        }
-    }
-    for addr in addrs {
-        if let Some(relay) = circuit_relay(addr) {
-            return format!("relay:{relay}");
+        if let Some(ip) = discovery::ip_of(addr) {
+            return match ip {
+                IpAddr::V4(ip) => {
+                    let [a, b, c, _] = ip.octets();
+                    format!("net4:{a}.{b}.{c}.0/24")
+                }
+                IpAddr::V6(ip) => {
+                    let segments = ip.segments();
+                    format!(
+                        "net6:{:x}:{:x}:{:x}:{:x}::/64",
+                        segments[0], segments[1], segments[2], segments[3]
+                    )
+                }
+            };
         }
     }
     format!("peer:{peer}")
@@ -1461,6 +1130,7 @@ enum IpfsQuery {
     },
 }
 
+const MAX_DIRECT_DIAL: usize = 8;
 const IPFS_REPROVIDE_MIN: Duration = Duration::from_secs(30);
 const IPFS_LOOKUP_FOUND: Duration = Duration::from_secs(300);
 const CACHE_SAVE_EVERY: Duration = Duration::from_secs(2);
@@ -1510,28 +1180,11 @@ impl EventLoop {
         self.in_flight.get(p).is_some_and(|s| !s.is_empty())
     }
 
-    fn trusted_relay(&self, relay: &PeerId) -> bool {
-        self.allowed.contains(relay)
-            || self.bb_good.contains(relay)
-            || self.anchors.iter().any(|a| a.peer == *relay)
-    }
-
-    fn rank_of(&self, conn: &ConnectionId, addr: &Multiaddr) -> u8 {
-        let r = rank(addr);
-        if r != 1 {
-            return r;
-        }
-        match self.conn_info.get(conn).and_then(|i| i.relay) {
-            Some(relay) if self.trusted_relay(&relay) => 1,
-            _ => 0,
-        }
-    }
-
     fn best_conn(&self, peer: &PeerId) -> Option<(ConnectionId, u8)> {
         self.conns
             .get(peer)?
             .iter()
-            .map(|(c, a)| (*c, self.rank_of(c, a)))
+            .map(|(c, a)| (*c, rank(a)))
             .max_by_key(|(c, r)| (*r, *c))
     }
 
@@ -1539,589 +1192,9 @@ impl EventLoop {
         self.conns
             .get(peer)
             .and_then(|m| m.get(&conn))
-            .map(|a| self.rank_of(&conn, a))
+            .map(rank)
             .unwrap_or(0)
     }
-
-    fn is_public(&self) -> bool {
-        self.nat_public || self.swarm.external_addresses().any(|a| !is_relayed(a))
-    }
-
-    fn has_bb_reservation(&self) -> bool {
-        self.reserved
-            .iter()
-            .any(|p| self.relay_listeners.contains_key(p))
-    }
-
-    fn maintain_public_relays(&mut self, now: Instant) {
-        let want = if self.cfg.public_relays == 0 || self.is_public() || self.has_bb_reservation() {
-            0
-        } else {
-            self.cfg.public_relays
-        };
-        if self.pub_relays.len() > want {
-            let drop: Vec<PeerId> = self.pub_relays.keys().copied().skip(want).collect();
-            for p in drop {
-                if let Some(id) = self.pub_relays.remove(&p) {
-                    self.swarm.remove_listener(id);
-                }
-                self.reserved.remove(&p);
-            }
-        }
-        if self.pub_relays.len() >= want || now < self.pub_next {
-            return;
-        }
-        let pick = self.pub_candidates.iter().find(|(p, _)| {
-            !self.pub_relays.contains_key(p)
-                && !self.relay_listeners.contains_key(p)
-                && self.pub_retry.get(p).is_none_or(|(t, _)| now >= *t)
-        });
-        let Some((p, addr)) = pick.cloned() else {
-            return;
-        };
-        self.pub_next = now + PUBLIC_RELAY_PACE;
-        let circuit = addr.with(Protocol::P2p(p)).with(Protocol::P2pCircuit);
-        match self.swarm.listen_on(circuit) {
-            Ok(id) => {
-                tracing::debug!(relay = %p, "public relay reservation requested");
-                self.pub_relays.insert(p, id);
-            }
-            Err(e) => {
-                tracing::debug!("public relay listen failed: {e}");
-                self.pub_failed(p, now);
-            }
-        }
-    }
-
-    fn pub_failed(&mut self, p: PeerId, now: Instant) {
-        let e = self
-            .pub_retry
-            .entry(p)
-            .or_insert((now, PUBLIC_RELAY_BACKOFF / 2));
-        e.1 = (e.1 * 2).min(PUBLIC_RELAY_BACKOFF_MAX);
-        e.0 = now + e.1;
-    }
-
-    fn add_pub_candidate(&mut self, peer: PeerId, addr: Multiaddr) {
-        if self.cfg.relay_only {
-            return;
-        }
-        let addr = split_peer(&addr).map(|(_, a)| a).unwrap_or(addr);
-        if let Some(ip) = ip4_of(&addr) {
-            let octets = ip.octets();
-            let prefix = &octets[..3];
-            if self
-                .pub_candidates
-                .iter()
-                .filter(|(p, a)| {
-                    *p != peer && ip4_of(a).is_some_and(|v| &v.octets()[..3] == prefix)
-                })
-                .count()
-                >= 2
-            {
-                return;
-            }
-        }
-        if let Some(i) = self.pub_candidates.iter().position(|(p, _)| *p == peer) {
-            self.pub_candidates.remove(i);
-        } else if self.pub_candidates.len() >= PUBLIC_RELAY_CANDIDATES {
-            let old = self
-                .pub_candidates
-                .iter()
-                .position(|(p, _)| !self.pub_relays.contains_key(p))
-                .unwrap_or(0);
-            self.pub_candidates.remove(old);
-        }
-        let at = self
-            .pub_candidates
-            .iter()
-            .position(|(_, a)| addr_scope(a) != Scope::Public)
-            .unwrap_or(self.pub_candidates.len());
-        let at = if addr_scope(&addr) == Scope::Public {
-            at
-        } else {
-            self.pub_candidates.len()
-        };
-        self.pub_candidates.insert(at, (peer, addr));
-    }
-
-    fn close_public_circuits(&mut self, now: Instant) {
-        let mut close = Vec::new();
-        for m in self.conns.values() {
-            let direct_old = m.iter().any(|(c, a)| {
-                rank(a) >= 2
-                    && self
-                        .conn_info
-                        .get(c)
-                        .is_some_and(|i| now.duration_since(i.since) >= PUBLIC_CIRCUIT_LINGER)
-            });
-            if direct_old {
-                close.extend(
-                    m.iter()
-                        .filter(|(c, a)| self.rank_of(c, a) == 0)
-                        .map(|(c, _)| *c),
-                );
-            }
-        }
-        for c in close {
-            self.swarm.close_connection(c);
-        }
-    }
-
-    fn has_direct(&self, peer: &PeerId) -> bool {
-        self.best_conn(peer).is_some_and(|(_, r)| r >= 2)
-    }
-
-    fn has_trusted_relay_conn(&self, peer: &PeerId) -> bool {
-        self.conns
-            .get(peer)
-            .is_some_and(|m| m.iter().any(|(c, a)| self.rank_of(c, a) == 1))
-    }
-
-    fn kick_direct(&mut self, peer: PeerId) {
-        if self.cfg.relay_only || self.has_direct(&peer) {
-            return;
-        }
-        let direct = self.peer_direct.get(&peer).cloned().unwrap_or_default();
-        if direct.is_empty() {
-            return;
-        }
-        let opts = DialOpts::peer_id(peer)
-            .addresses(direct)
-            .condition(PeerCondition::Always)
-            .build();
-        if let Err(e) = self.swarm.dial(opts) {
-            tracing::debug!(%peer, "direct dial failed: {e}");
-        }
-    }
-
-    fn dial_circuits(&mut self, peer: PeerId) -> bool {
-        let known = self.peer_circuits.get(&peer).cloned().unwrap_or_default();
-        let trusted: Vec<Multiaddr> = known
-            .iter()
-            .filter(|a| circuit_relay(a).is_some_and(|r| self.trusted_relay(&r)))
-            .cloned()
-            .collect();
-        if trusted.is_empty() {
-            return false;
-        }
-        let opts = DialOpts::peer_id(peer)
-            .addresses(trusted)
-            .condition(PeerCondition::Always)
-            .build();
-        if let Err(e) = self.swarm.dial(opts) {
-            tracing::debug!(%peer, "relay circuit dial failed: {e}");
-            return false;
-        }
-        true
-    }
-
-    fn redial_relayed(&mut self, peer: PeerId) {
-        let carrying: Vec<ConnectionId> = self
-            .tunnels
-            .get(&peer)
-            .map(|t| t.streams.values().map(|(_, c)| *c).collect())
-            .unwrap_or_default();
-        let relayed: Vec<ConnectionId> = self
-            .conns
-            .get(&peer)
-            .map(|m| {
-                m.iter()
-                    .filter(|(c, a)| is_relayed(a) && !carrying.contains(c))
-                    .map(|(c, _)| *c)
-                    .collect()
-            })
-            .unwrap_or_default();
-        tracing::debug!(%peer, "hole punch retry, redialing relayed connection");
-        if self.dial_circuits(peer) {
-            if let Some(t) = self.tunnels.get_mut(&peer) {
-                t.stale_relayed.extend(relayed);
-            }
-        }
-    }
-
-    fn close_stale_relayed(&mut self, peer: &PeerId, fresh: ConnectionId) {
-        let Some(t) = self.tunnels.get_mut(peer) else {
-            return;
-        };
-        let old = std::mem::take(&mut t.stale_relayed);
-        let stale: Vec<ConnectionId> = old
-            .into_iter()
-            .filter(|c| *c != fresh && !t.carries(c))
-            .collect();
-        for c in stale {
-            self.swarm.close_connection(c);
-        }
-    }
-
-    fn wait_direct(&mut self, peer: PeerId) {
-        let now = Instant::now();
-        let Some(t) = self.tunnels.get_mut(&peer) else {
-            return;
-        };
-        t.retry_at = now + DIRECT_WAIT_TICK;
-        if t.nodirect_sent {
-            return;
-        }
-        let since = *t.nodirect_since.get_or_insert(now);
-        if t.circuit_dialed.is_none() {
-            t.circuit_dialed = Some(now);
-            self.kick_direct(peer);
-            self.dial_circuits(peer);
-            return;
-        }
-        let elapsed = now.duration_since(since);
-        if elapsed >= self.cfg.relay_after {
-            self.fallback(peer, "timed out");
-            return;
-        }
-        if self.dialing(&peer) {
-            return;
-        }
-        if !self.cfg.hole_punch {
-            if elapsed >= NO_PUNCH_WAIT {
-                self.fallback(peer, "hole punching disabled");
-            }
-            return;
-        }
-        if !self.punch_failed.contains(&peer) {
-            if elapsed < PUNCH_RESULT_WAIT.min(self.cfg.direct_grace) {
-                return;
-            }
-            tracing::debug!(%peer, "no direct connection after the hole punch window");
-            self.punch_failed.insert(peer);
-        }
-        let Some(t) = self.tunnels.get_mut(&peer) else {
-            return;
-        };
-        match t.punch.step(now) {
-            PunchStep::Wait => {}
-            PunchStep::Retry => self.redial_relayed(peer),
-            PunchStep::Exhausted => match self.guesses.get(&peer).map(|g| g.outcome) {
-                None => {
-                    tracing::info!(%peer, "punch failed after retries");
-                    if !self.start_guess(peer) {
-                        self.fallback(peer, "port guess unavailable");
-                    }
-                }
-                Some(None) => {}
-                Some(Some(_)) => self.fallback(peer, "direct attempts failed"),
-            },
-        }
-    }
-
-    fn fallback(&mut self, peer: PeerId, why: &str) {
-        let now = Instant::now();
-        let trusted = self.has_trusted_relay_conn(&peer);
-        let every = self.cfg.direct_retry_every;
-        let Some(t) = self.tunnels.get_mut(&peer) else {
-            return;
-        };
-        if trusted {
-            if !t.relay_ok {
-                t.relay_ok = true;
-                t.bg_next = now + every;
-                let local = t.local;
-                tracing::info!(%peer, why, "relay fallback");
-                self.emit(Event::TunnelFallback { peer, local });
-            }
-            self.start_open(peer);
-            return;
-        }
-        t.nodirect_sent = true;
-        let local = t.local;
-        let ever = t.ever_up;
-        for w in t.waiters.drain(..) {
-            let _ = w.send(Err(anyhow!(
-                "no direct path to peer (strict NAT); public relays carry control traffic only"
-            )));
-        }
-        tracing::info!(%peer, why, "no direct path and no trusted relay");
-        self.emit(Event::TunnelNoDirect { peer, local });
-        if !ever {
-            self.drop_tunnel(peer, "no direct path", false);
-        }
-    }
-
-    fn bg_direct(&mut self, peer: PeerId, now: Instant) {
-        if self.cfg.relay_only {
-            return;
-        }
-        tracing::debug!(%peer, "on relay, retrying direct in the background");
-        self.kick_direct(peer);
-        if !self.cfg.hole_punch {
-            return;
-        }
-        self.dial_circuits(peer);
-        if guess_due(self.guesses.get(&peer), now) {
-            self.guesses.remove(&peer);
-            self.start_guess(peer);
-        }
-    }
-
-    fn prune_spare_relayed(&mut self, peer: PeerId, now: Instant) {
-        let Some(t) = self.tunnels.get(&peer) else {
-            return;
-        };
-        if t.streams.is_empty() || t.top() != Some(1) {
-            return;
-        }
-        let spare: Vec<ConnectionId> = self
-            .conns
-            .get(&peer)
-            .map(|m| {
-                m.iter()
-                    .filter(|(c, a)| {
-                        is_relayed(a)
-                            && !t.carries(c)
-                            && self.conn_info.get(c).is_some_and(|i| {
-                                now.duration_since(i.since) >= SPARE_RELAYED_LINGER
-                            })
-                    })
-                    .map(|(c, _)| *c)
-                    .collect()
-            })
-            .unwrap_or_default();
-        for c in spare {
-            self.swarm.close_connection(c);
-        }
-    }
-
-    fn own_ip4(&self) -> Option<Ipv4Addr> {
-        global_ip4_from(self.swarm.external_addresses().filter(|a| !is_relayed(a)))
-            .or_else(|| self.observed_ip4.filter(global_ip4))
-            .or_else(|| global_ip4_from(self.swarm.listeners().filter(|a| !is_relayed(a))))
-    }
-
-    fn direct_ip4(&self, peer: &PeerId) -> Option<Ipv4Addr> {
-        self.conns
-            .get(peer)?
-            .values()
-            .filter(|a| !is_relayed(a))
-            .find_map(|a| ip4_of(a))
-    }
-
-    fn guess_peer_ip4(&self, peer: &PeerId) -> Option<Ipv4Addr> {
-        let advertised = self.peer_direct.get(peer).map(Vec::as_slice).unwrap_or(&[]);
-        peer_guess_ip4(self.direct_ip4(peer), advertised)
-            .or_else(|| {
-                self.swarm.behaviour().ipfs.as_ref()
-                    .and_then(|ipfs| global_ip4_from(ipfs.dial_candidates(peer)))
-            })
-    }
-
-    fn start_guess(&mut self, peer: PeerId) -> bool {
-        if !self.cfg.port_guess || !self.cfg.hole_punch || self.guesses.contains_key(&peer) {
-            return false;
-        }
-        let Some(ip) = self.own_ip4() else {
-            tracing::debug!(%peer, "port guess deferred: no local public IPv4 address");
-            return false;
-        };
-        let Some(peer_ip) = self.guess_peer_ip4(&peer) else {
-            tracing::debug!(%peer, "port guess deferred: no peer IPv4 candidate");
-            return false;
-        };
-        let Some((conn, _)) = self.best_conn(&peer) else {
-            return false;
-        };
-        let run = self.next_sid;
-        self.next_sid += 1;
-        self.guesses.insert(
-            peer,
-            Guess {
-                run,
-                initiator: true,
-                since: Instant::now(),
-                listener: None,
-                outcome: None,
-            },
-        );
-        let (tx, rx) = futures::channel::oneshot::channel::<Result<libp2p::Stream, String>>();
-        self.swarm.behaviour_mut().guess.open(peer, conn, tx);
-        let plan = self.cfg.port_guess_plan.clone();
-        let inner = self.inner_tx.clone();
-        tracing::debug!(%peer, "port guess started");
-        tokio::spawn(async move {
-            let result = async {
-                let mut s = rx.await.map_err(|_| "connection closed".to_string())??;
-                let mine = portguess::nonce();
-                let offer = portguess::Offer {
-                    nonce: mine,
-                    ip,
-                    port: 0,
-                };
-                let theirs = tokio::time::timeout(GUESS_OFFER_TIMEOUT, async {
-                    rpc::write_frame(&mut s, &offer.encode()).await?;
-                    rpc::read_frame(&mut s, portguess::OFFER_LEN).await
-                })
-                .await
-                .map_err(|_| "offer timed out".to_string())?
-                .map_err(|e| format!("offer: {e}"))?;
-                let _ = s.close().await;
-                let theirs = portguess::Offer::decode(&theirs)
-                    .ok_or_else(|| "peer declined port guess".to_string())?;
-                if theirs.ip != peer_ip {
-                    return Err("offer ip does not match connection".to_string());
-                }
-                portguess::many(&plan, theirs, mine).await
-            }
-            .await;
-            let _ = inner.send(Inner::Guessed { peer, run, result });
-        });
-        true
-    }
-
-    fn on_guess_inbound(&mut self, peer: PeerId, mut stream: libp2p::Stream) {
-        let yield_to_peer = peer < self.me;
-        let busy = self.guesses.get(&peer).is_some_and(|g| {
-            g.outcome
-                .is_some_and(|_| g.since.elapsed() < GUESS_RETRY_AFTER)
-                || (g.outcome.is_none() && !(g.initiator && g.listener.is_none() && yield_to_peer))
-        });
-        let ok =
-            self.cfg.port_guess && self.cfg.hole_punch && self.allowed.contains(&peer) && !busy;
-        let ip = self.own_ip4().filter(|_| ok);
-        let peer_ip = self.guess_peer_ip4(&peer).filter(|_| ok);
-        let (Some(ip), Some(peer_ip)) = (ip, peer_ip) else {
-            tracing::debug!(%peer, busy, "port guess request declined");
-            tokio::spawn(async move {
-                let _ = tokio::time::timeout(GUESS_OFFER_TIMEOUT, stream.close()).await;
-            });
-            return;
-        };
-        let run = self.next_sid;
-        self.next_sid += 1;
-        self.guesses.insert(
-            peer,
-            Guess {
-                run,
-                initiator: false,
-                since: Instant::now(),
-                listener: None,
-                outcome: None,
-            },
-        );
-        let plan = self.cfg.port_guess_plan.clone();
-        let inner = self.inner_tx.clone();
-        tokio::spawn(async move {
-            let result = async {
-                let mine = portguess::nonce();
-                let (theirs, sock) = tokio::time::timeout(GUESS_OFFER_TIMEOUT, async {
-                    let theirs = rpc::read_frame(&mut stream, portguess::OFFER_LEN).await?;
-                    let theirs =
-                        portguess::Offer::decode(&theirs).ok_or_else(|| anyhow!("bad offer"))?;
-                    anyhow::ensure!(theirs.ip == peer_ip, "offer ip does not match connection");
-                    let sock = portguess::bind(0)?;
-                    let port = sock.local_addr()?.port();
-                    rpc::write_frame(
-                        &mut stream,
-                        &portguess::Offer {
-                            nonce: mine,
-                            ip,
-                            port,
-                        }
-                        .encode(),
-                    )
-                    .await?;
-                    let _ = stream.close().await;
-                    anyhow::Ok((theirs, sock))
-                })
-                .await
-                .map_err(|_| "offer timed out".to_string())?
-                .map_err(|e| format!("offer: {e}"))?;
-                portguess::spray(&plan, sock, theirs, mine).await
-            }
-            .await;
-            let _ = inner.send(Inner::Guessed { peer, run, result });
-        });
-    }
-
-    fn guess_done(&mut self, peer: PeerId, ok: bool, why: &str) {
-        let Some(g) = self.guesses.get_mut(&peer) else {
-            return;
-        };
-        if g.outcome.is_some() {
-            return;
-        }
-        g.outcome = Some(ok);
-        g.since = Instant::now();
-        let listener = if ok { None } else { g.listener.take() };
-        if let Some(id) = listener {
-            self.swarm.remove_listener(id);
-        }
-        if ok {
-            tracing::info!(%peer, "port-guess ok");
-        } else {
-            tracing::info!(%peer, why, "port-guess failed");
-        }
-        self.emit(Event::PortGuess { peer, ok });
-    }
-
-    fn on_guessed(&mut self, peer: PeerId, run: u64, result: Result<portguess::Win, String>) {
-        if self
-            .guesses
-            .get(&peer)
-            .is_none_or(|g| g.run != run || g.outcome.is_some())
-        {
-            return;
-        }
-        let win = match result {
-            Ok(w) => w,
-            Err(e) => return self.guess_done(peer, false, &e),
-        };
-        tracing::debug!(%peer, ?win, "port guess found a udp path");
-        let listen = Multiaddr::empty()
-            .with(Protocol::Ip4(Ipv4Addr::UNSPECIFIED))
-            .with(Protocol::Udp(win.local_port))
-            .with(Protocol::QuicV1);
-        let listener = match self.swarm.listen_on(listen) {
-            Ok(id) => id,
-            Err(e) => return self.guess_done(peer, false, &format!("listen on guessed port: {e}")),
-        };
-        if let Some(g) = self.guesses.get_mut(&peer) {
-            g.listener = Some(listener);
-            g.since = Instant::now();
-        }
-        let addr = Multiaddr::empty()
-            .with(Protocol::Ip4(*win.remote.ip()))
-            .with(Protocol::Udp(win.remote.port()))
-            .with(Protocol::QuicV1);
-        let inner = self.inner_tx.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(GUESS_DIAL_DELAY).await;
-            let _ = inner.send(Inner::GuessDial { peer, addr });
-        });
-    }
-
-    fn guess_tick(&mut self, now: Instant) {
-        let spray = self.cfg.port_guess_plan.capped().spray_for;
-        let late: Vec<PeerId> = self
-            .guesses
-            .iter()
-            .filter(|(_, g)| {
-                let limit = if g.listener.is_some() {
-                    GUESS_DIAL_GRACE
-                } else {
-                    spray + GUESS_OFFER_TIMEOUT * 3
-                };
-                g.outcome.is_none() && now.duration_since(g.since) >= limit
-            })
-            .map(|(p, _)| *p)
-            .collect();
-        for p in late {
-            self.guess_done(p, false, "no direct connection through the guessed port");
-        }
-    }
-
-    fn forget_guess(&mut self, peer: &PeerId) {
-        if let Some(g) = self.guesses.remove(peer) {
-            if let Some(id) = g.listener {
-                self.swarm.remove_listener(id);
-            }
-        }
-    }
-
     fn on_command(&mut self, cmd: Command) {
         let me = self.me;
         match cmd {
@@ -2201,30 +1274,17 @@ impl EventLoop {
             }
             Command::Connect { peer, reply } => self.connect_peer(peer, Some(reply)),
             Command::Dial { addr, reply } => {
-                let relay_peer = split_peer(&addr).map(|(peer, _)| peer);
-                let is_configured_relay = relay_peer.is_some_and(|peer| {
-                    self.cfg.relays.iter().any(|relay| {
-                        split_peer(relay).is_some_and(|(candidate, _)| candidate == peer)
-                    })
-                });
-                if self.cfg.relay_only && !is_relayed(&addr) && !is_configured_relay {
-                    let _ =
-                        reply.send(Err(anyhow!("direct dials are disabled in relay-only mode")));
-                } else {
-                    if let Some((peer, base)) = split_peer(&addr) {
-                        self.swarm.behaviour_mut().kad.add_address(&peer, base);
-                    }
-                    let _ = reply.send(self.swarm.dial(addr).map_err(|e| anyhow!("dial: {e}")));
+                if let Some((peer, base)) = split_peer(&addr) {
+                    self.swarm.behaviour_mut().kad.add_address(&peer, base);
                 }
+                let _ = reply.send(self.swarm.dial(addr).map_err(|e| anyhow!("dial: {e}")));
             }
             Command::Disconnect { peer } => {
                 let _ = self.swarm.disconnect_peer_id(peer);
             }
             Command::AddExternal { addr } => {
                 let addr = split_peer(&addr).map(|(_, a)| a).unwrap_or(addr);
-                if !self.cfg.relay_only {
-                    self.swarm.add_external_address(addr);
-                }
+                self.swarm.add_external_address(addr);
             }
             Command::ListenAddrs { reply } => {
                 let _ = reply.send(self.swarm.listeners().cloned().collect());
@@ -2246,7 +1306,6 @@ impl EventLoop {
                     .map(|(p, t)| TunnelInfo {
                         peer: *p,
                         local: t.local,
-                        relayed: t.top().is_none_or(|r| r <= 1),
                         streams: t.streams.len(),
                     })
                     .collect();
@@ -2261,20 +1320,14 @@ impl EventLoop {
                         .is_none_or(|peers| peers.contains(&peer));
                 if allow && permitted {
                     self.allowed.insert(peer);
-                    self.relay_peers.lock().unwrap().insert(peer);
                 } else {
                     self.allowed.remove(&peer);
-                    if !self.bb_good.contains(&peer) && !self.anchors.iter().any(|a| a.peer == peer)
-                    {
-                        self.relay_peers.lock().unwrap().remove(&peer);
-                    }
                     self.drop_tunnel(peer, "denied", true);
                 }
             }
             Command::RpcOk { peer } => {
                 if self.bb_good.len() < BB_GOOD_MAX || self.bb_good.contains(&peer) {
                     self.bb_good.insert(peer);
-                    self.relay_peers.lock().unwrap().insert(peer);
                     if let Some(c) = self.cache.as_mut() {
                         c.good(peer);
                     }
@@ -2364,7 +1417,7 @@ impl EventLoop {
         }
     }
 
-    fn new_tunnel(&mut self, peer: PeerId, opener: bool) -> std::io::Result<SocketAddr> {
+    fn new_tunnel(&mut self, peer: PeerId) -> std::io::Result<SocketAddr> {
         let sock = tunnel::bind_loopback()?;
         let local = sock.local_addr()?;
         let ctl = tunnel::spawn(peer, sock, self.targets.clone(), self.note_tx.clone());
@@ -2377,20 +1430,12 @@ impl EventLoop {
                 streams: HashMap::new(),
                 pending: 0,
                 opening: None,
-                opener,
-                relay_ok: !opener,
-                bg_next: now + self.cfg.direct_retry_every,
                 waiters: vec![],
                 retry_at: now + TUNNEL_BACKOFF,
                 backoff: TUNNEL_BACKOFF,
                 down_since: now,
                 ever_up: false,
                 path: None,
-                nodirect_since: None,
-                nodirect_sent: false,
-                circuit_dialed: None,
-                stale_relayed: Vec::new(),
-                punch: PunchRetry::default(),
             },
         );
         Ok(local)
@@ -2414,7 +1459,7 @@ impl EventLoop {
             let _ = reply.send(Err(anyhow!("tunnel limit reached")));
             return;
         }
-        if let Err(e) = self.new_tunnel(peer, true) {
+        if let Err(e) = self.new_tunnel(peer) {
             let _ = reply.send(Err(anyhow!("bind: {e}")));
             return;
         }
@@ -2427,21 +1472,6 @@ impl EventLoop {
             self.connect_peer(peer, None);
             return;
         };
-        let relay_ok = self.tunnels.get(&peer).is_some_and(|t| t.relay_ok);
-        if rank == 0 || (rank == 1 && !relay_ok) {
-            let direct_known = self
-                .peer_direct
-                .get(&peer)
-                .is_some_and(|addrs| !addrs.is_empty());
-            if rank == 1 && !direct_known && self.has_trusted_relay_conn(&peer) {
-                if let Some(t) = self.tunnels.get_mut(&peer) {
-                    t.relay_ok = true;
-                }
-            } else {
-                self.wait_direct(peer);
-                return;
-            }
-        }
         let sid = self.next_sid;
         self.next_sid += 1;
         let Some(t) = self.tunnels.get_mut(&peer) else {
@@ -2490,17 +1520,10 @@ impl EventLoop {
         let Some(t) = self.tunnels.get_mut(&peer) else {
             return;
         };
-        if rank == 1 {
-            t.relay_ok = true;
-        }
         t.streams.insert(sid, (rank, conn));
         let _ = t.ctl.send(tunnel::Ctl::Attach { sid, stream, rank });
         t.ever_up = true;
         t.backoff = TUNNEL_BACKOFF;
-        t.nodirect_since = None;
-        t.nodirect_sent = false;
-        t.circuit_dialed = None;
-        t.punch = PunchRetry::default();
         for w in t.waiters.drain(..) {
             let _ = w.send(Ok(t.local));
         }
@@ -2527,18 +1550,14 @@ impl EventLoop {
             return;
         };
         let Some(top) = t.top() else { return };
-        let relayed = top <= 1;
-        if t.path != Some(relayed) {
-            match (t.path, relayed) {
-                (Some(true), false) => tracing::info!(%peer, "tunnel migrated to direct"),
-                (_, false) => tracing::info!(%peer, "tunnel direct"),
-                (_, true) => tracing::info!(%peer, "tunnel on relay"),
-            }
-            t.path = Some(relayed);
+        if t.path != Some(top) {
+            let quic = top >= 3;
+            tracing::info!(%peer, quic, "tunnel path");
+            t.path = Some(top);
             let e = Event::TunnelPath {
                 peer,
                 local: t.local,
-                relayed,
+                quic,
             };
             self.emit(e);
         }
@@ -2548,13 +1567,6 @@ impl EventLoop {
         let Some(t) = self.tunnels.remove(&peer) else {
             return;
         };
-        if self
-            .guesses
-            .get(&peer)
-            .is_none_or(|g| g.outcome != Some(true))
-        {
-            self.forget_guess(&peer);
-        }
         let _ = t.ctl.send(if notify_remote {
             tunnel::Ctl::Close
         } else {
@@ -2576,8 +1588,6 @@ impl EventLoop {
         let rank = self.conn_rank(&peer, conn);
         let verdict = if !self.allowed.contains(&peer) {
             Err("not authorized")
-        } else if rank == 0 {
-            Err("public relay path")
         } else if let Some(t) = self.tunnels.get(&peer) {
             if t.streams.len() + t.pending >= self.cfg.max_streams_per_peer {
                 Err("stream limit")
@@ -2589,7 +1599,7 @@ impl EventLoop {
         } else if self.tunnels.len() >= self.cfg.max_tunnels {
             Err("tunnel limit")
         } else {
-            match self.new_tunnel(peer, false) {
+            match self.new_tunnel(peer) {
                 Ok(local) => {
                     self.emit(Event::TunnelAccepted { peer, local });
                     Ok(())
@@ -2715,22 +1725,6 @@ impl EventLoop {
                 self.drop_tunnel(peer, "closed by peer", false)
             }
             Inner::Fallback(r) => self.on_fallback(r),
-            Inner::Guessed { peer, run, result } => self.on_guessed(peer, run, result),
-            Inner::GuessDial { peer, addr } => {
-                if self
-                    .guesses
-                    .get(&peer)
-                    .is_some_and(|g| g.outcome.is_none() && g.listener.is_some())
-                {
-                    let opts = DialOpts::peer_id(peer)
-                        .addresses(vec![addr])
-                        .condition(PeerCondition::Always)
-                        .build();
-                    if let Err(e) = self.swarm.dial(opts) {
-                        self.guess_done(peer, false, &format!("dial: {e}"));
-                    }
-                }
-            }
         }
     }
 
@@ -2870,8 +1864,7 @@ impl EventLoop {
             push(a.clone(), &mut out);
         }
         for a in self.swarm.listeners() {
-            let keep =
-                is_relayed(a) || (self.cfg.ipfs_announce_lan && addr_scope(a) != Scope::Loopback);
+            let keep = self.cfg.ipfs_announce_lan && addr_scope(a) != Scope::Loopback;
             if keep {
                 push(a.clone(), &mut out);
             }
@@ -3087,23 +2080,15 @@ impl EventLoop {
     }
 
     fn store_source(&self, peer: PeerId) -> Option<store::StoreSource> {
-        let addresses = self.conns.get(&peer)?;
-        addresses
+        self.conns
+            .get(&peer)?
             .values()
-            .filter(|addr| !is_relayed(addr))
             .find_map(discovery::ip_of)
             .map(store::StoreSource::Ip)
-            .or_else(|| {
-                addresses
-                    .values()
-                    .find_map(circuit_relay)
-                    .map(store::StoreSource::Relay)
-            })
     }
 
     fn on_bb_peer(&mut self, peer: PeerId, addrs: Vec<Multiaddr>) {
         let new = self.bb_peers.insert(peer);
-        self.bb_claimed.lock().unwrap().insert(peer);
         if let Some(c) = self.cache.as_mut() {
             c.seen(peer, addrs);
         }
@@ -3157,16 +2142,11 @@ impl EventLoop {
             let addr = a.addr.clone();
             let _ = self.swarm.dial(addr);
         }
-        self.maintain_relays(now);
-        self.close_public_circuits(now);
         self.discovery_tick(now);
         self.purge(now);
-        self.guess_tick(now);
         let window = self.cfg.tunnel_reconnect_window;
-        let every = self.cfg.direct_retry_every;
         let peers: Vec<PeerId> = self.tunnels.keys().copied().collect();
         for peer in peers {
-            self.prune_spare_relayed(peer, now);
             let best = self.best_conn(&peer).map(|(_, r)| r);
             let lower = self.me < peer;
             let Some(t) = self.tunnels.get_mut(&peer) else {
@@ -3176,8 +2156,7 @@ impl EventLoop {
                 continue;
             }
             if t.streams.is_empty() {
-                let hold = t.nodirect_since.is_some() && !t.nodirect_sent;
-                if now.duration_since(t.down_since) > window && !hold {
+                if now.duration_since(t.down_since) > window {
                     self.drop_tunnel(peer, "peer unreachable", false);
                     continue;
                 }
@@ -3187,39 +2166,8 @@ impl EventLoop {
             } else if lower && best > t.top() {
                 t.retry_at = now + Duration::from_secs(1);
                 self.start_open(peer);
-            } else if t.opener && t.relay_ok && t.top() == Some(1) && now >= t.bg_next {
-                t.bg_next = now + every;
-                self.bg_direct(peer, now);
             }
         }
-    }
-
-    fn maintain_relays(&mut self, now: Instant) {
-        let mut want = self.cfg.relays.clone();
-        if self.cfg.auto_relay && self.nat_private {
-            want.extend(self.cfg.bootstrap.iter().cloned());
-        }
-        for addr in want {
-            let Some((p, _)) = split_peer(&addr) else {
-                continue;
-            };
-            if !self.connected(&p)
-                || self.relay_listeners.contains_key(&p)
-                || self.relay_retry.get(&p).is_some_and(|t| now < *t)
-            {
-                continue;
-            }
-            match self.swarm.listen_on(addr.with(Protocol::P2pCircuit)) {
-                Ok(id) => {
-                    self.relay_listeners.insert(p, id);
-                }
-                Err(e) => {
-                    tracing::debug!("relay listen failed: {e}");
-                    self.relay_retry.insert(p, now + Duration::from_secs(2));
-                }
-            }
-        }
-        self.maintain_public_relays(now);
     }
 
     fn on_kad(&mut self, ev: kad::Event) {
@@ -3409,24 +2357,13 @@ impl EventLoop {
                     Ok(ok) => ok.peers,
                     Err(kad::GetClosestPeersError::Timeout { peers, .. }) => peers,
                 };
-                let mut addrs: Vec<Multiaddr> = peers
+                let addrs: Vec<Multiaddr> = peers
                     .into_iter()
                     .filter(|i| i.peer_id == peer)
                     .flat_map(|i| i.addrs)
                     .collect();
-                for relay in &self.cfg.relays {
-                    if split_peer(relay).is_some() {
-                        let circuit = relay
-                            .clone()
-                            .with(Protocol::P2pCircuit)
-                            .with(Protocol::P2p(peer));
-                        if !addrs.contains(&circuit) {
-                            addrs.push(circuit);
-                        }
-                    }
-                }
                 let mut addrs = self.swarm.behaviour_mut().kad.dialable(&peer, addrs);
-                addrs.sort_by_key(|a| (!is_quic(a), is_relayed(a)));
+                addrs.sort_by_key(|a| !is_quic(a));
                 if self.connected(&peer) {
                     for r in self.dials.remove(&peer).unwrap_or_default() {
                         let _ = r.send(Ok(()));
@@ -3466,73 +2403,34 @@ impl EventLoop {
                 endpoint,
                 ..
             } => {
-                let relayed = endpoint.is_relayed();
-                let mut addr = endpoint.get_remote_address().clone();
-                if relayed && !is_relayed(&addr) {
-                    addr = Multiaddr::empty()
-                        .with(Protocol::P2pCircuit)
-                        .with(Protocol::P2p(peer_id));
-                }
-                if !relayed {
-                    let scope = addr_scope(&addr);
-                    let local_only = !self.cfg.listen.is_empty()
-                        && self
-                            .cfg
-                            .listen
-                            .iter()
-                            .all(|listen| addr_scope(listen) == Scope::Loopback);
-                    if scope == Scope::Public || (local_only && scope == Scope::Loopback) {
-                        let base = split_peer(&addr)
-                            .map(|(_, base)| base)
-                            .unwrap_or_else(|| addr.clone());
-                        if self.bb_peers.contains(&peer_id)
-                            || self.anchors.iter().any(|anchor| anchor.peer == peer_id)
-                            || (local_only && scope == Scope::Loopback)
-                        {
-                            self.swarm
-                                .behaviour_mut()
-                                .kad
-                                .add_address(&peer_id, base.clone());
-                        }
-                        if scope == Scope::Public {
-                            if let Some(ipfs) = self.swarm.behaviour_mut().ipfs.as_mut() {
-                                ipfs.kad.add_address(&peer_id, base);
-                            }
+                let addr = endpoint.get_remote_address().clone();
+                let scope = addr_scope(&addr);
+                let local_only = !self.cfg.listen.is_empty()
+                    && self
+                        .cfg
+                        .listen
+                        .iter()
+                        .all(|listen| addr_scope(listen) == Scope::Loopback);
+                if scope == Scope::Public || (local_only && scope == Scope::Loopback) {
+                    let base = split_peer(&addr)
+                        .map(|(_, base)| base)
+                        .unwrap_or_else(|| addr.clone());
+                    if self.bb_peers.contains(&peer_id)
+                        || self.anchors.iter().any(|anchor| anchor.peer == peer_id)
+                        || (local_only && scope == Scope::Loopback)
+                    {
+                        self.swarm
+                            .behaviour_mut()
+                            .kad
+                            .add_address(&peer_id, base.clone());
+                    }
+                    if scope == Scope::Public {
+                        if let Some(ipfs) = self.swarm.behaviour_mut().ipfs.as_mut() {
+                            ipfs.kad.add_address(&peer_id, base);
                         }
                     }
                 }
                 self.done_dialing(&peer_id, connection_id);
-                let relay = if relayed {
-                    match &endpoint {
-                        libp2p::core::ConnectedPoint::Dialer { address, .. } => {
-                            circuit_relay(address)
-                        }
-                        libp2p::core::ConnectedPoint::Listener { local_addr, .. } => {
-                            circuit_relay(local_addr)
-                        }
-                    }
-                } else {
-                    self.punch_failed.remove(&peer_id);
-                    if self
-                        .guesses
-                        .get(&peer_id)
-                        .is_some_and(|g| g.outcome.is_none() && g.listener.is_some())
-                    {
-                        self.guess_done(peer_id, true, "");
-                    }
-                    None
-                };
-                self.conn_info.insert(
-                    connection_id,
-                    ConnInfo {
-                        relay,
-                        dialer: endpoint.is_dialer(),
-                        since: Instant::now(),
-                    },
-                );
-                if relayed {
-                    self.close_stale_relayed(&peer_id, connection_id);
-                }
                 self.conns
                     .entry(peer_id)
                     .or_default()
@@ -3552,11 +2450,9 @@ impl EventLoop {
                         t.retry_at = Instant::now();
                     }
                 }
-                self.maintain_relays(Instant::now());
                 self.emit(Event::Connected {
                     peer: peer_id,
                     addr,
-                    relayed,
                 });
             }
             SwarmEvent::ConnectionClosed {
@@ -3568,52 +2464,12 @@ impl EventLoop {
                 if let Some(m) = self.conns.get_mut(&peer_id) {
                     m.remove(&connection_id);
                 }
-                self.conn_info.remove(&connection_id);
                 if num_established == 0 {
                     self.conns.remove(&peer_id);
                     self.rec_peer_slots.remove(&peer_id);
                     self.peer_direct.remove(&peer_id);
-                    self.forget_guess(&peer_id);
                     self.bb_peers.remove(&peer_id);
-                    self.bb_claimed.lock().unwrap().remove(&peer_id);
-                    if !self.allowed.contains(&peer_id)
-                        && !self.bb_good.contains(&peer_id)
-                        && !self.anchors.iter().any(|a| a.peer == peer_id)
-                    {
-                        self.relay_peers.lock().unwrap().remove(&peer_id);
-                    }
-                    self.reserved.remove(&peer_id);
-                    if let Some(id) = self.relay_listeners.remove(&peer_id) {
-                        self.swarm.remove_listener(id);
-                    }
-                    if let Some(id) = self.pub_relays.remove(&peer_id) {
-                        self.swarm.remove_listener(id);
-                        self.pub_failed(peer_id, Instant::now());
-                    }
                     self.emit(Event::Disconnected { peer: peer_id });
-                }
-            }
-            SwarmEvent::ListenerClosed { listener_id, .. } => {
-                let relay = self
-                    .relay_listeners
-                    .iter()
-                    .find(|(_, id)| **id == listener_id)
-                    .map(|(p, _)| *p);
-                if let Some(p) = relay {
-                    self.relay_listeners.remove(&p);
-                    self.reserved.remove(&p);
-                    self.relay_retry
-                        .insert(p, Instant::now() + Duration::from_millis(500));
-                }
-                let public = self
-                    .pub_relays
-                    .iter()
-                    .find(|(_, id)| **id == listener_id)
-                    .map(|(p, _)| *p);
-                if let Some(p) = public {
-                    self.pub_relays.remove(&p);
-                    self.reserved.remove(&p);
-                    self.pub_failed(p, Instant::now());
                 }
             }
             SwarmEvent::OutgoingConnectionError {
@@ -3665,10 +2521,9 @@ impl EventLoop {
                     })
                     .collect();
                 let obs = &info.observed_addr;
-                if !is_relayed(obs) && addr_scope(obs) == Scope::Public {
+                if addr_scope(obs) == Scope::Public {
                     if let Some(voter) = via
                         .as_ref()
-                        .filter(|a| !is_relayed(a))
                         .and_then(discovery::ip_of)
                     {
                         if self.observed_votes.len() >= 32 && !self.observed_votes.contains_key(obs)
@@ -3707,90 +2562,41 @@ impl EventLoop {
                 } else {
                     self.swarm.behaviour_mut().kad.remove_peer(&peer_id);
                 }
-                let dialer_direct = self
-                    .conn_info
-                    .get(&connection_id)
-                    .is_some_and(|i| i.dialer && i.relay.is_none());
-                if info.protocols.contains(&relay::HOP_PROTOCOL_NAME)
-                    && !info.protocols.contains(&rpc::PROTO)
-                    && dialer_direct
-                {
-                    if let Some(v) = via.clone().filter(|v| !is_relayed(v)) {
-                        self.add_pub_candidate(peer_id, v);
-                    }
-                }
                 if info.protocols.contains(&rpc::PROTO) {
                     let via_loopback = via
                         .as_ref()
                         .is_some_and(|v| addr_scope(v) == Scope::Loopback);
-                    let direct: Vec<Multiaddr> = if self.cfg.relay_only {
-                        Vec::new()
-                    } else {
-                        info.listen_addrs
-                            .iter()
-                            .map(|a| match split_peer(a) {
-                                Some((p, base)) if p == peer_id => base,
-                                _ => a.clone(),
-                            })
-                            .filter(|a| !is_relayed(a) && !is_unspecified(a) && !is_dns(a))
-                            .filter(|a| via_loopback || addr_scope(a) != Scope::Loopback)
-                            .filter(|a| {
-                                via_loopback || !is_ip6(a) || addr_scope(a) == Scope::Public
-                            })
-                            .take(MAX_DIRECT_DIAL)
-                            .collect()
-                    };
-                    let dial: Vec<Multiaddr> = direct
+                    let direct: Vec<Multiaddr> = info
+                        .listen_addrs
                         .iter()
+                        .map(|a| match split_peer(a) {
+                            Some((p, base)) if p == peer_id => base,
+                            _ => a.clone(),
+                        })
+                        .filter(|a| !is_unspecified(a) && !is_dns(a))
+                        .filter(|a| via_loopback || addr_scope(a) != Scope::Loopback)
+                        .filter(|a| via_loopback || !is_ip6(a) || addr_scope(a) == Scope::Public)
                         .filter(|a| kad_addr_allowed(a, via.as_ref(), lan))
-                        .cloned()
+                        .take(MAX_DIRECT_DIAL)
                         .collect();
-                    let has_direct = self.best_conn(&peer_id).is_some_and(|(_, r)| r >= 2);
-                    if !has_direct
-                        && !dial.is_empty()
+                    let has_quic = self.best_conn(&peer_id).is_some_and(|(_, r)| r >= 3);
+                    let quic: Vec<Multiaddr> = direct.iter().filter(|a| is_quic(a)).cloned().collect();
+                    if !has_quic
+                        && !quic.is_empty()
                         && self.peer_direct.get(&peer_id) != Some(&direct)
                         && self.identify_dial_allowed(peer_id)
                     {
-                        tracing::debug!(%peer_id, ?dial, "relayed bb peer, dialing its listen addrs");
+                        tracing::debug!(%peer_id, ?quic, "peer reachable over quic, dialing it");
                         let opts = DialOpts::peer_id(peer_id)
-                            .addresses(dial)
+                            .addresses(quic)
                             .condition(PeerCondition::Always)
                             .build();
                         if let Err(e) = self.swarm.dial(opts) {
-                            tracing::debug!(%peer_id, "direct dial failed: {e}");
+                            tracing::debug!(%peer_id, "quic dial failed: {e}");
                         }
                     }
                     self.peer_direct.insert(peer_id, direct);
-                    let circuits: Vec<Multiaddr> = info
-                        .listen_addrs
-                        .iter()
-                        .filter(|a| is_relayed(a))
-                        .cloned()
-                        .collect();
-                    if self.peer_circuits.get(&peer_id) != Some(&circuits) {
-                        if let Some(t) = self.tunnels.get_mut(&peer_id) {
-                            t.circuit_dialed = None;
-                        }
-                        self.peer_circuits.insert(peer_id, circuits);
-                    }
-                    let mut keep = good;
-                    if let Some(v) = via.filter(|v| {
-                        is_relayed(v)
-                            && v.iter().any(|p| {
-                                matches!(
-                                    p,
-                                    Protocol::Ip4(_)
-                                        | Protocol::Ip6(_)
-                                        | Protocol::Dns(_)
-                                        | Protocol::Dns4(_)
-                                        | Protocol::Dns6(_)
-                                        | Protocol::Dnsaddr(_)
-                                )
-                            })
-                    }) {
-                        keep.push(v);
-                    }
-                    self.on_bb_peer(peer_id, keep);
+                    self.on_bb_peer(peer_id, good);
                 }
             }
             BehaviourEvent::Ipfs(e) => self.on_ipfs(e),
@@ -3829,9 +2635,7 @@ impl EventLoop {
                 }
             }
             BehaviourEvent::Autonat(autonat::Event::StatusChanged { new, .. }) => {
-                self.nat_private = matches!(new, autonat::NatStatus::Private);
                 let public = matches!(new, autonat::NatStatus::Public(_));
-                self.nat_public = public;
                 if let Some(ipfs) = self.swarm.behaviour_mut().ipfs.as_mut() {
                     ipfs.kad.set_mode(Some(if public {
                         kad::Mode::Server
@@ -3839,77 +2643,10 @@ impl EventLoop {
                         kad::Mode::Client
                     }));
                 }
-                self.maintain_relays(Instant::now());
-                self.emit(Event::Reachability {
-                    public: matches!(new, autonat::NatStatus::Public(_)),
-                });
-            }
-            BehaviourEvent::RelayClient(relay::client::Event::ReservationReqAccepted {
-                relay_peer_id,
-                ..
-            }) => {
-                self.reserved.insert(relay_peer_id);
-                if self.pub_relays.contains_key(&relay_peer_id) {
-                    self.pub_retry
-                        .insert(relay_peer_id, (Instant::now(), PUBLIC_RELAY_BACKOFF / 2));
-                }
-                self.maintain_public_relays(Instant::now());
-                self.emit(Event::RelayReservation {
-                    relay: relay_peer_id,
-                });
-            }
-            BehaviourEvent::RelayServer(relay::Event::ReservationReqAccepted {
-                src_peer_id,
-                renewed,
-            }) => {
-                tracing::warn!(peer = %src_peer_id, renewed, "relay reservation accepted");
-            }
-            BehaviourEvent::RelayServer(relay::Event::ReservationReqDenied {
-                src_peer_id,
-                status,
-            }) => {
-                tracing::warn!(peer = %src_peer_id, ?status, "relay reservation denied");
-            }
-            BehaviourEvent::RelayServer(relay::Event::ReservationClosed { src_peer_id }) => {
-                tracing::warn!(peer = %src_peer_id, "relay reservation closed");
-            }
-            BehaviourEvent::RelayServer(relay::Event::CircuitReqAccepted {
-                src_peer_id,
-                dst_peer_id,
-            }) => {
-                tracing::warn!(src = %src_peer_id, dst = %dst_peer_id, "relay circuit accepted");
-            }
-            BehaviourEvent::RelayServer(relay::Event::CircuitReqDenied {
-                src_peer_id,
-                dst_peer_id,
-                status,
-            }) => {
-                tracing::warn!(src = %src_peer_id, dst = %dst_peer_id, ?status, "relay circuit denied");
-            }
-            BehaviourEvent::Dcutr(dcutr::Event {
-                remote_peer_id,
-                result,
-            }) => {
-                match &result {
-                    Ok(_) => {
-                        tracing::info!(peer = %remote_peer_id, "punch ok");
-                        self.punch_failed.remove(&remote_peer_id);
-                    }
-                    Err(e) => {
-                        tracing::debug!(peer = %remote_peer_id, "punch attempt failed: {e}");
-                        self.punch_failed.insert(remote_peer_id);
-                    }
-                }
-                self.emit(Event::HolePunch {
-                    peer: remote_peer_id,
-                    ok: result.is_ok(),
-                });
+                self.emit(Event::Reachability { public });
             }
             BehaviourEvent::Pipe(pipe::Inbound { peer, conn, stream }) => {
                 self.on_inbound(peer, conn, stream)
-            }
-            BehaviourEvent::Guess(pipe::Inbound { peer, stream, .. }) => {
-                self.on_guess_inbound(peer, stream)
             }
             BehaviourEvent::Upnp(e) => {
                 if let Some(ev) = upnp_note(&mut self.upnp_mapped, &mut self.upnp_failed, e) {
@@ -3928,15 +2665,8 @@ impl EventLoop {
                     .conns
                     .get(&peer)
                     .and_then(|m| m.get(&conn))
-                    .map(|addr| {
-                        if let Some(relay) = circuit_relay(addr) {
-                            rpc::Bucket::Relay(relay)
-                        } else {
-                            discovery::ip_of(addr)
-                                .map(rpc::Bucket::Ip)
-                                .unwrap_or(rpc::Bucket::Unknown)
-                        }
-                    })
+                    .and_then(discovery::ip_of)
+                    .map(rpc::Bucket::Ip)
                     .unwrap_or(rpc::Bucket::Unknown);
                 let trusted = self.allowed.contains(&peer) || self.bb_good.contains(&peer);
                 match self.gate.admit_bucket(peer, bucket, trusted) {
@@ -4021,49 +2751,6 @@ mod tests {
     }
 
     #[test]
-    fn relay_limits_sized_for_game_traffic() {
-        let limits = RelayLimits::default();
-        assert_eq!(limits.per_peer_per_minute, 120);
-        assert_eq!(limits.per_ip_per_minute, 240);
-        let c = relay_config(&limits, true, Default::default(), Default::default());
-        assert_eq!(c.max_circuit_bytes, 64 << 20);
-        assert_eq!(c.max_circuit_duration, Duration::from_secs(10 * 60));
-        assert_eq!(c.max_circuits, 32);
-        assert_eq!(c.max_circuits_per_peer, 8);
-        assert_eq!(c.max_reservations, 16);
-        assert_eq!(c.max_reservations_per_peer, 1);
-        assert_eq!(c.circuit_src_rate_limiters.len(), 2);
-        assert_eq!(c.reservation_rate_limiters.len(), 2);
-    }
-
-    #[test]
-    fn configured_relay_limits_replace_stricter_library_defaults() {
-        let mut c = relay_config(
-            &RelayLimits::default(),
-            true,
-            Default::default(),
-            Default::default(),
-        );
-        let peer = PeerId::random();
-        let address = ma("/ip4/8.8.8.8/tcp/4001");
-        let now = std::time::Instant::now();
-        for attempt in 0..31 {
-            assert!(
-                c.reservation_rate_limiters
-                    .iter_mut()
-                    .all(|limiter| limiter.try_next(peer, &address, now)),
-                "reservation attempt {attempt} unexpectedly hit a lower library default"
-            );
-            assert!(
-                c.circuit_src_rate_limiters
-                    .iter_mut()
-                    .all(|limiter| limiter.try_next(peer, &address, now)),
-                "circuit attempt {attempt} unexpectedly hit a lower library default"
-            );
-        }
-    }
-
-    #[test]
     fn foreign_record_storage_requires_local_kademlia_closeness() {
         let key = kad::RecordKey::new(&b"topic/publisher".to_vec());
         let me = PeerId::random();
@@ -4079,53 +2766,6 @@ mod tests {
         assert!(!record_store_allowed(&key, me, &peers));
         peers.pop();
         assert!(record_store_allowed(&key, me, &peers));
-    }
-
-    #[test]
-    fn closed_relay_admits_only_known_peers() {
-        let peers: RelayPeers = Default::default();
-        let claimed: RelayPeers = Default::default();
-        let mut c = relay_config(
-            &RelayLimits::default(),
-            false,
-            peers.clone(),
-            claimed.clone(),
-        );
-        let (known, stranger) = (PeerId::random(), PeerId::random());
-        peers.lock().unwrap().insert(known);
-        let a = ma("/ip4/1.2.3.4/tcp/1");
-        let now = std::time::Instant::now();
-        let ok = |c: &mut relay::Config, p: PeerId| {
-            c.reservation_rate_limiters
-                .iter_mut()
-                .all(|l| l.try_next(p, &a, now))
-        };
-        assert!(ok(&mut c, known));
-        assert!(!ok(&mut c, stranger));
-        assert!(
-            !c.circuit_src_rate_limiters
-                .last_mut()
-                .unwrap()
-                .try_next(stranger, &a, now)
-        );
-        assert!(
-            c.circuit_src_rate_limiters
-                .last_mut()
-                .unwrap()
-                .try_next(known, &a, now)
-        );
-        let bb = PeerId::random();
-        claimed.lock().unwrap().insert(bb);
-        assert!(
-            !ok(&mut c, bb),
-            "identify claim alone must not get a reservation"
-        );
-        assert!(
-            !c.circuit_src_rate_limiters
-                .last_mut()
-                .unwrap()
-                .try_next(bb, &a, now)
-        );
     }
 
     #[test]
@@ -4152,94 +2792,18 @@ mod tests {
     }
 
     #[test]
-    fn direct_quic_ranks_above_tcp_above_relay() {
-        let q = ma("/ip4/1.2.3.4/udp/1/quic-v1");
-        let t = ma("/ip4/1.2.3.4/tcp/1");
-        let r: Multiaddr = format!("/ip4/1.2.3.4/tcp/1/p2p/{}/p2p-circuit", PeerId::random())
-            .parse()
-            .unwrap();
-        assert!(rank(&q) > rank(&t) && rank(&t) > rank(&r));
+    fn direct_quic_ranks_above_tcp() {
+        assert!(rank(&ma("/ip4/1.2.3.4/udp/1/quic-v1")) > rank(&ma("/ip4/1.2.3.4/tcp/1")));
     }
 
     #[test]
-    fn background_guess_starts_without_prior_attempt_and_respects_cooldown() {
-        let since = Instant::now();
-        assert!(guess_due(None, since));
-        let mut guess = Guess {
-            run: 1,
-            initiator: true,
-            since,
-            listener: None,
-            outcome: None,
-        };
-        assert!(!guess_due(Some(&guess), since + GUESS_RETRY_AFTER));
-        guess.outcome = Some(false);
-        assert!(!guess_due(
-            Some(&guess),
-            since + GUESS_RETRY_AFTER - Duration::from_millis(1)
-        ));
-        assert!(guess_due(Some(&guess), since + GUESS_RETRY_AFTER));
-        guess.outcome = Some(true);
-        assert!(!guess_due(Some(&guess), since + GUESS_RETRY_AFTER));
-    }
-
-    #[test]
-    fn port_guess_uses_public_identify_address_when_control_is_relayed() {
+    fn global_ip4_skips_private_addresses() {
         let advertised = [
             ma("/ip4/192.168.1.20/udp/49551/quic-v1"),
             ma("/ip4/8.8.4.4/udp/65184/quic-v1"),
         ];
-        assert_eq!(
-            peer_guess_ip4(None, &advertised),
-            Some("8.8.4.4".parse().unwrap())
-        );
-        assert_eq!(
-            peer_guess_ip4(Some("192.168.1.20".parse().unwrap()), &advertised),
-            Some("192.168.1.20".parse().unwrap())
-        );
+        assert_eq!(global_ip4_from(&advertised), Some("8.8.4.4".parse().unwrap()));
         assert_eq!(global_ip4_from([&advertised[0]]), None);
-        let relay = ma(&format!(
-            "/ip4/132.226.115.3/tcp/4001/p2p/{}/p2p-circuit",
-            PeerId::random()
-        ));
-        assert_eq!(global_ip4_from([&relay]), None);
-    }
-
-    #[test]
-    fn punch_retries_before_exhausted() {
-        let t0 = Instant::now();
-        let mut p = PunchRetry::default();
-        assert!(!p.active());
-        assert_eq!(p.step(t0), PunchStep::Wait);
-        assert!(p.active());
-        assert_eq!(p.step(t0 + Duration::from_secs(1)), PunchStep::Wait);
-        let mut now = t0 + PUNCH_BACKOFF[0];
-        let mut retries = 0;
-        let mut waited = PUNCH_BACKOFF[0];
-        loop {
-            match p.step(now) {
-                PunchStep::Retry => {
-                    retries += 1;
-                    assert_eq!(p.step(now), PunchStep::Wait);
-                    let gap = PUNCH_BACKOFF[retries.min(PUNCH_BACKOFF.len() - 1)];
-                    now += gap;
-                    waited += gap;
-                }
-                PunchStep::Exhausted => break,
-                PunchStep::Wait => panic!("unexpected wait"),
-            }
-        }
-        assert_eq!(retries, PUNCH_BACKOFF.len());
-        assert_eq!(waited, Duration::from_secs(2 + 4 + 6 + 6));
-        assert!(
-            waited + PUNCH_BACKOFF[0] < RELAY_AFTER,
-            "punch retries must leave time for port guess before relay"
-        );
-        assert_eq!(p.step(now), PunchStep::Exhausted);
-        let mut fresh = PunchRetry::default();
-        fresh.step(t0);
-        fresh = PunchRetry::default();
-        assert!(!fresh.active());
     }
 
     #[test]
@@ -4254,7 +2818,6 @@ mod tests {
         ] {
             assert!(s.iter().any(|x| x == want), "missing {want} in {s:?}");
         }
-        assert!(c.relay_after <= Duration::from_secs(45));
     }
 
     #[test]
@@ -4310,26 +2873,12 @@ mod tests {
     }
 
     #[test]
-    fn world_identity_bucket_groups_ipv4_prefixes_and_relay_clients() {
-        let peer = PeerId::random();
-        let a = network_source_bucket(peer, &[ma("/ip4/8.8.8.1/tcp/4001")]);
+    fn network_bucket_groups_ipv4_prefixes() {
+        let a = network_source_bucket(PeerId::random(), &[ma("/ip4/8.8.8.1/tcp/4001")]);
         let b = network_source_bucket(PeerId::random(), &[ma("/ip4/8.8.8.254/tcp/4001")]);
         assert_eq!(a, b);
-        let relay = PeerId::random();
-        let c = network_source_bucket(
-            peer,
-            &[ma(&format!(
-                "/ip4/8.8.8.8/tcp/4001/p2p/{relay}/p2p-circuit/p2p/{peer}"
-            ))],
-        );
-        let d = network_source_bucket(
-            PeerId::random(),
-            &[ma(&format!(
-                "/ip4/8.8.8.8/tcp/4001/p2p/{relay}/p2p-circuit/p2p/{}",
-                PeerId::random()
-            ))],
-        );
-        assert_eq!(c, d);
+        let p = PeerId::random();
+        assert_eq!(network_source_bucket(p, &[]), format!("peer:{p}"));
     }
 
     #[test]

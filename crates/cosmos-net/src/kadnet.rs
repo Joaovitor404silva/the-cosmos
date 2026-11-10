@@ -20,7 +20,6 @@ pub struct Kad {
     scopes: HashMap<ConnectionId, (PeerId, Scope)>,
     lan_peers: HashSet<PeerId>,
     local_only: bool,
-    relay_only: bool,
     dns_peers: std::collections::HashSet<PeerId>,
 }
 
@@ -41,7 +40,6 @@ impl Kad {
     pub fn new(
         inner: Inner,
         local_only: bool,
-        relay_only: bool,
         dns_peers: std::collections::HashSet<PeerId>,
     ) -> Self {
         Kad {
@@ -49,7 +47,6 @@ impl Kad {
             scopes: HashMap::new(),
             lan_peers: HashSet::new(),
             local_only,
-            relay_only,
             dns_peers,
         }
     }
@@ -74,30 +71,11 @@ impl Kad {
     }
 
     pub fn dialable(&mut self, peer: &PeerId, addrs: Vec<Multiaddr>) -> Vec<Multiaddr> {
-        if self.relay_only {
-            return addrs
-                .into_iter()
-                .filter(|addr| {
-                    crate::is_relayed(addr)
-                        && (addr_scope(addr) == Scope::Public
-                            || crate::circuit_relay(addr)
-                                .is_some_and(|relay| self.dns_peers.contains(&relay)))
-                        && (!is_dns(addr)
-                            || crate::circuit_relay(addr)
-                                .is_some_and(|relay| self.dns_peers.contains(&relay)))
-                })
-                .collect();
-        }
         addrs
             .into_iter()
             .filter(|a| {
-                if let Some(relay) = crate::circuit_relay(a) {
-                    return self.dns_peers.contains(&relay);
-                }
                 let s = addr_scope(a);
-                (!is_dns(a)
-                    || self.dns_peers.contains(peer)
-                    || crate::circuit_relay(a).is_some_and(|relay| self.dns_peers.contains(&relay)))
+                (!is_dns(a) || self.dns_peers.contains(peer))
                     && (s == Scope::Public
                         || (self.local_only && s == Scope::Loopback)
                         || (self.lan_peers.contains(peer) && s == Scope::Private)
@@ -212,7 +190,7 @@ mod tests {
             Store::new(me, 1 << 16),
             kad::Config::new(StreamProtocol::new("/t/kad")),
         );
-        let mut k = Kad::new(inner, false, false, Default::default());
+        let mut k = Kad::new(inner, false, Default::default());
         let p = PeerId::random();
         let public: Multiaddr = "/ip4/1.2.3.4/tcp/1".parse().unwrap();
         let lan: Multiaddr = "/ip4/192.168.1.5/tcp/80".parse().unwrap();
@@ -249,7 +227,7 @@ mod tests {
         );
         let configured = PeerId::random();
         let stranger = PeerId::random();
-        let mut allowed = Kad::new(inner, false, false, [configured].into_iter().collect());
+        let mut allowed = Kad::new(inner, false, [configured].into_iter().collect());
         let configured_dns: Multiaddr =
             format!("/dns4/bootstrap.example/tcp/4001/p2p/{configured}")
                 .parse()

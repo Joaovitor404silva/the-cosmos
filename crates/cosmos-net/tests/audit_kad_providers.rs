@@ -2,7 +2,7 @@ use futures::StreamExt;
 use libp2p::kad::{self, store::MemoryStore, store::MemoryStoreConfig};
 use libp2p::swarm::SwarmEvent;
 use libp2p::{StreamProtocol, Swarm, noise, tcp, yamux};
-use cosmos_net::{Config, Multiaddr, Node, PeerId, is_relayed};
+use cosmos_net::{Config, Multiaddr, Node, PeerId};
 use sha2::{Digest, Sha256};
 use std::future::Future;
 use std::time::{Duration, Instant};
@@ -16,7 +16,6 @@ fn base() -> Config {
         ],
         mdns: false,
         upnp: false,
-        auto_relay: false,
         ..Config::default()
     }
 }
@@ -25,7 +24,7 @@ async fn tcp_addr(n: &Node) -> Multiaddr {
     n.listen_addrs()
         .await
         .into_iter()
-        .find(|a| a.to_string().contains("/tcp/") && !is_relayed(a))
+        .find(|a| a.to_string().contains("/tcp/"))
         .expect("tcp")
 }
 

@@ -11,7 +11,6 @@ use std::time::Instant;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum StoreSource {
     Ip(IpAddr),
-    Relay(PeerId),
 }
 
 pub const PER_SOURCE: usize = 64;
@@ -433,25 +432,6 @@ mod tests {
                     Some(StoreSource::Ip("9.9.9.9".parse().unwrap()))
                 )
                 .is_ok()
-        );
-    }
-
-    #[test]
-    fn relayed_provider_sybils_share_the_relay_quota() {
-        let mut store = Store::new(PeerId::random(), 1 << 16);
-        let source = StoreSource::Relay(PeerId::random());
-        for index in 0..(PER_SOURCE * 4) {
-            store
-                .add_foreign_provider_from(prov(&key(index), PeerId::random()), Some(source))
-                .unwrap();
-        }
-        assert!(
-            store
-                .add_foreign_provider_from(
-                    prov(&key(PER_SOURCE * 4), PeerId::random()),
-                    Some(source)
-                )
-                .is_err()
         );
     }
 

@@ -6,7 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-libp2p = { version = "0.57.1", features = ["tokio", "tcp", "quic", "noise", "yamux", "identify", "kad", "gossipsub", "mdns", "autonat", "relay", "dcutr", "upnp", "ping", "macros", "ed25519", "rsa", "dns"] }
+libp2p = { version = "0.57.1", features = ["tokio", "tcp", "quic", "noise", "yamux", "identify", "kad", "gossipsub", "mdns", "autonat", "upnp", "ping", "macros", "ed25519", "rsa", "dns"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
 futures = "0.3"
 sha2 = "0.10"

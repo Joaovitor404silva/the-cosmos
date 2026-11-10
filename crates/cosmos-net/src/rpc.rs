@@ -87,7 +87,6 @@ struct Counters {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Bucket {
     Ip(IpAddr),
-    Relay(PeerId),
     Unknown,
 }
 
@@ -501,24 +500,4 @@ mod tests {
         held.push(g.admit_from(PeerId::random(), Some(ip), false).unwrap());
     }
 
-    #[test]
-    fn relay_identity_caps_many_remote_peers_and_releases_slots() {
-        let gate = Gate::new(RpcLimits {
-            max_in_flight_per_ip: 2,
-            ..Default::default()
-        });
-        let relay = Bucket::Relay(PeerId::random());
-        let first = gate.admit_bucket(PeerId::random(), relay, false).unwrap();
-        let _second = gate.admit_bucket(PeerId::random(), relay, false).unwrap();
-        assert_eq!(
-            gate.admit_bucket(PeerId::random(), relay, false).err(),
-            Some(Reject::Busy)
-        );
-        assert!(
-            gate.admit_bucket(PeerId::random(), Bucket::Relay(PeerId::random()), false)
-                .is_ok()
-        );
-        drop(first);
-        assert!(gate.admit_bucket(PeerId::random(), relay, false).is_ok());
-    }
 }
