@@ -127,6 +127,7 @@ typedef struct Game {
     size_t my_id_len;
     uint32_t my_tag, host_peer;
     int steam_on; /* Steam relay path enabled */
+    volatile int quitting; /* game_free asked the workers to stop retrying */
     uint32_t rng;
 
     /* world: authoritative on the host, mirrored from snapshots elsewhere */

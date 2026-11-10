@@ -5,10 +5,14 @@
  *   host -> all  SNAP   players + monsters + items, unreliable, 6 per second
  *   host -> all  EVENT  kill / death / pickup, reliable
  *   any -> any   HELLO  my tag (identity), reliable
- *   client->host INTENT step or bump-attack or descend, reliable, numbered;
- *                the client moves at once (prediction) and replays its
- *                unacknowledged intents over every snapshot.
- * A late joiner gets LEVEL plus a reliable SNAP from the host.
+ *   client->host INTENT step or bump-attack or descend, reliable, numbered
+ *                and stamped with the level (an intent for an old level is
+ *                dropped); the client moves at once (prediction) and replays
+ *                its unacknowledged intents over every snapshot.
+ * A late joiner gets LEVEL plus a reliable SNAP from the host. A snapshot
+ * of a newer level also rebuilds it, so a lost LEVEL heals.
+ * Only cosmos_host_peer() may send LEVEL / SNAP / EVENT; the host refuses
+ * a HELLO tag already in use. Depth goes on the wire as u16.
  *
  * Async plane (records under key "d<depth>", so any run reaches them):
  *   "note"  [room, dx, dy, text]   a player's note on a floor tile
@@ -113,7 +117,8 @@ static int job_main(void *arg) {
     int r;
     if (j->what == JOB_HOST) {
         /* COSMOS_E_NET right after start-up: no DHT peers yet, retry. */
-        for (int t = 0; (r = cosmos_host(c, j->code, sizeof j->code)) == COSMOS_E_NET && t < 60; t++) plat_sleep(500);
+        for (int t = 0; (r = cosmos_host(c, j->code, sizeof j->code)) == COSMOS_E_NET && t < 60 && !j->g->quitting; t++)
+            plat_sleep(500);
     } else if (j->what == JOB_JOIN) {
         r = cosmos_join(c, j->code);
     } else {
@@ -213,9 +218,7 @@ static Peer *peer_entry(Game *g, uint32_t peer, int add) {
     if (!add || !free_slot) return NULL;
     memset(free_slot, 0, sizeof *free_slot);
     free_slot->peer = peer;
-    /* The SDK reports path switches only. Without Steam, direct is the
-     * one path there is; with it, the first switch tells. */
-    free_slot->path = g->steam_on ? COSMOS_PATH_UNKNOWN : COSMOS_PATH_DIRECT;
+    free_slot->path = COSMOS_PATH_UNKNOWN; /* the SDK reports it right after the join */
     return free_slot;
 }
 
@@ -334,9 +337,9 @@ static void apply_level(Game *g, uint32_t seed, int depth) {
 }
 
 static void send_level(Game *g, uint32_t to) {
-    uint8_t m[6] = {MSG_LEVEL};
+    uint8_t m[7] = {MSG_LEVEL};
     put_u32(m + 1, g->lv.seed);
-    m[5] = (uint8_t)g->lv.depth;
+    put_u16(m + 5, (uint16_t)g->lv.depth);
     cosmos_send(g->c, to, CH_GAME, m, sizeof m, 1);
 }
 
@@ -346,7 +349,7 @@ static size_t build_snap(const Game *g, uint8_t *m) {
     m[n++] = MSG_SNAP;
     put_u32(m + n, g->tick); n += 4;
     put_u32(m + n, g->lv.seed); n += 4;
-    m[n++] = (uint8_t)g->lv.depth;
+    put_u16(m + n, (uint16_t)g->lv.depth); n += 2;
     for (int i = 0; i < g->lv.n_items; i++) taken |= (uint8_t)(g->lv.items[i].taken << i);
     m[n++] = taken;
     np = &m[n++];
@@ -376,7 +379,7 @@ static size_t build_snap(const Game *g, uint8_t *m) {
     return n;
 }
 
-#define SNAP_MAX (12 + MAX_PLAYERS * 10 + 1 + MAX_MONSTERS * 4)
+#define SNAP_MAX (13 + MAX_PLAYERS * 10 + 1 + MAX_MONSTERS * 4)
 
 static void send_snap(Game *g, uint32_t to, int reliable) {
     uint8_t m[SNAP_MAX];
@@ -414,11 +417,15 @@ static void apply_snap(Game *g, const uint8_t *d, size_t len) {
     size_t n;
     uint32_t tick;
     int np, nm;
-    if (len < 13) return;
+    if (len < 14) return;
     tick = get_u32(d + 1);
-    if (!g->have_level || get_u32(d + 5) != g->lv.seed || d[9] != g->lv.depth) return;
+    if (!g->have_level || get_u32(d + 5) != g->lv.seed || get_u16(d + 9) != g->lv.depth) {
+        /* A newer level than ours: its LEVEL was lost (queue overflow). */
+        if (g->have_level && get_u16(d + 9) < g->lv.depth) return;
+        apply_level(g, get_u32(d + 5), get_u16(d + 9));
+    }
     if (tick <= g->tick) return; /* stale (unreliable can reorder) */
-    n = 10;
+    n = 11;
     for (int i = 0; i < g->lv.n_items; i++) g->lv.items[i].taken = (d[n] >> i) & 1;
     n++;
     np = d[n++];
@@ -529,7 +536,7 @@ static Player *host_add_player(Game *g, uint32_t peer, uint32_t tag) {
         if (g->pl[i].active && g->pl[i].peer == peer) return &g->pl[i];
         if (!g->pl[i].active && !p) p = &g->pl[i];
     }
-    if (!p) return NULL;
+    if (!p || tag == 0 || game_slot_of(g, tag) >= 0) return NULL; /* tags must be unique */
     for (int i = 0; i < MAX_PLAYERS; i++) /* join next to someone alive */
         if (g->pl[i].active && g->pl[i].hp > 0) { ax = g->pl[i].x; ay = g->pl[i].y; break; }
     memset(p, 0, sizeof *p);
@@ -657,9 +664,10 @@ int game_input(Game *g, int act) {
         me->q[me->qn] = (uint8_t)act;
         me->qseq[me->qn++] = g->seq;
     } else {
-        uint8_t m[4] = {MSG_INTENT};
+        uint8_t m[6] = {MSG_INTENT};
         put_u16(m + 1, g->seq);
         m[3] = (uint8_t)act;
+        put_u16(m + 4, (uint16_t)g->lv.seed);
         cosmos_send(g->c, g->host_peer, CH_GAME, m, sizeof m, 1);
     }
     return 1;
@@ -707,8 +715,18 @@ Game *game_new(const DepthsConfig *cfg, char *err, size_t cap) {
     return g;
 }
 
+/* A join or put can block for a while; when one is still running after a
+ * short wait we leave the handle to process exit instead of freezing the
+ * window (cosmos_shutdown must not run during another call). */
 void game_free(Game *g) {
+    double until;
     if (!g) return;
+    g->quitting = 1;
+    until = plat_now() + 1.5;
+    while ((g->net.thread && !plat_thread_done(g->net.thread)) || (g->put.thread && !plat_thread_done(g->put.thread))) {
+        if (plat_now() > until) return;
+        plat_sleep(20);
+    }
     plat_thread_join(g->net.thread);
     plat_thread_join(g->put.thread);
     cosmos_shutdown(g->c);
@@ -737,13 +755,14 @@ void game_join(Game *g, const char *code) {
 
 static void on_message(Game *g, const cosmos_event_t *ev) {
     const uint8_t *d = ev->data;
-    Peer *pe = peer_entry(g, ev->peer, 1);
+    Peer *pe = peer_entry(g, ev->peer, 0);
     if (ev->channel != CH_GAME || ev->len < 1) return;
+    if (!g->is_host && !g->host_peer) g->host_peer = cosmos_host_peer(g->c);
     if (d[0] == MSG_HELLO && ev->len == 5) {
         if (pe) pe->tag = get_u32(d + 1);
         if (g->is_host && g->have_level) host_add_player(g, ev->peer, get_u32(d + 1));
     } else if (g->is_host) {
-        if (d[0] == MSG_INTENT && ev->len == 4 && d[3] < ACT_COUNT) {
+        if (d[0] == MSG_INTENT && ev->len == 6 && d[3] < ACT_COUNT && get_u16(d + 4) == (uint16_t)g->lv.seed) {
             for (int i = 0; i < MAX_PLAYERS; i++) {
                 Player *p = &g->pl[i];
                 if (!p->active || p->peer != ev->peer || p->qn >= MAX_PENDING) continue;
@@ -751,12 +770,11 @@ static void on_message(Game *g, const cosmos_event_t *ev) {
                 p->qseq[p->qn++] = get_u16(d + 1);
             }
         }
-    } else if (d[0] == MSG_LEVEL && ev->len == 6 && (!g->host_peer || g->host_peer == ev->peer)) {
-        g->host_peer = ev->peer;
-        if (pe) pe->is_host = 1;
-        apply_level(g, get_u32(d + 1), d[5]);
     } else if (ev->peer != g->host_peer) {
         return; /* only the host decides the world */
+    } else if (d[0] == MSG_LEVEL && ev->len == 7) {
+        if (pe) pe->is_host = 1;
+        apply_level(g, get_u32(d + 1), get_u16(d + 5));
     } else if (d[0] == MSG_SNAP) {
         apply_snap(g, d, ev->len);
     } else if (d[0] == MSG_EVENT) {
@@ -788,7 +806,7 @@ static void poll_events(Game *g) {
             break;
         case COSMOS_EV_MESSAGE: on_message(g, &ev); break;
         case COSMOS_EV_PATH_CHANGED:
-            if ((pe = peer_entry(g, ev.peer, 1))) pe->path = ev.path;
+            if ((pe = peer_entry(g, ev.peer, 0))) pe->path = ev.path;
             break;
         case COSMOS_EV_RECORD_RESULT:
         case COSMOS_EV_RECORD_UPDATE: on_record(g, &ev); break;
@@ -813,6 +831,7 @@ static void collect_jobs(Game *g) {
             g->state = ST_PLAYING;
             copy_str(g->code, sizeof g->code, g->net.code);
             copy_str(g->status, sizeof g->status, g->is_host ? "hosting" : "joined");
+            if (!g->is_host) g->host_peer = cosmos_host_peer(g->c);
             if (g->is_host) {
                 level_generate(&g->lv, 0, 1); /* rooms for the first spawn */
                 g->have_level = 1;

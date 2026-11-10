@@ -690,6 +690,10 @@ impl Cosmos {
 
     fn start_session(&self, mut s: Session) {
         let mut rx = s.take_events().expect("fresh session");
+        // Set before any event can be polled, so cosmos_host_peer() is
+        // valid for every session event the game sees.
+        let s = Arc::new(s);
+        *lock(&self.st.session) = Some(s.clone());
         let shared = self.st.shared.clone();
         let pump = self.rt.spawn(async move {
             while let Some(e) = rx.recv().await {
@@ -708,7 +712,6 @@ impl Cosmos {
             }
         });
         lock(&self.st.tasks).push(pump);
-        *lock(&self.st.session) = Some(Arc::new(s));
     }
 
     /// Claim the handle's one host/join, or `E_STATE`.

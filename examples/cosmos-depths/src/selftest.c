@@ -70,9 +70,11 @@ static int world_matches(int i) {
     return 1;
 }
 
+static int move_x, move_y; /* where player 1 stepped to */
+
 static int moved_for_all(void) {
     for (int i = 0; i < 3; i++) if (!world_matches(i)) return 0;
-    return game_me(g[1])->x == g[1]->me_x && game_me(g[1])->y == g[1]->me_y;
+    return host_view(1)->x == move_x && host_view(1)->y == move_y && game_me(g[1])->x == move_x && game_me(g[1])->y == move_y;
 }
 
 static int monster_placed(void) {
@@ -156,7 +158,9 @@ int selftest(void) {
         }
     }
     if (dir < 0 || !game_input(g[1], dir)) { fail("no free step"); goto out; }
-    if (g[1]->me_x != p->x + DIR_X[dir] || g[1]->me_y != p->y + DIR_Y[dir]) { fail("prediction"); goto out; }
+    move_x = p->x + DIR_X[dir];
+    move_y = p->y + DIR_Y[dir];
+    if (g[1]->me_x != move_x || g[1]->me_y != move_y) { fail("prediction"); goto out; }
     if (!wait_for(moved_for_all, 10)) { fail("move sync"); goto out; }
     printf("ok: player 1 move predicted at once, confirmed by host, seen by all\n");
 
