@@ -30,7 +30,7 @@ async fn main() -> anyhow::Result<()> {
         Some(v)
     };
     let app_id = opt("--appid").map(|v| v.parse().unwrap_or_else(|_| usage())).unwrap_or(480);
-    let dll = opt("--dll").map(PathBuf::from).or_else(|| {
+    let dll = opt("--dll").map(|p| std::path::absolute(PathBuf::from(p)).unwrap_or_else(|_| usage())).or_else(|| {
         let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vendor/steam").join(cosmos_steam::DLL_NAME);
         (std::env::var_os(cosmos_steam::DLL_ENV).is_none() && dev.exists()).then_some(dev)
     });

@@ -14,7 +14,8 @@
 //! license). Put `steam_api64.dll` from the Steamworks SDK
 //! (`redistributable_bin/win64/`, also shipped in the `steamworks-sys` crate
 //! under `lib/steam/redistributable_bin/win64/`) at `vendor/steam/` in the
-//! repo root, next to the exe, or point `COSMOS_STEAM_API` at it.
+//! repo root or next to the exe, and pass its absolute path in
+//! `SteamConfig::dll` (debug builds may use `COSMOS_STEAM_API` instead).
 //!
 //! TODO(M3 lobby): Steam lobby invite -> join code needs `ISteamMatchmaking`
 //! (CreateLobby call results, lobby data) and the overlay's

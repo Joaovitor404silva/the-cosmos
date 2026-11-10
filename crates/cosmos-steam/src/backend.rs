@@ -38,6 +38,9 @@ pub trait SteamBackend: Send + Sync + 'static {
     fn poll(&self, out: &mut Vec<SteamEvent>);
     /// Drop the session with `peer`.
     fn close(&self, peer: SteamId);
+    /// We are about to talk to `peer`: accept its session requests even when
+    /// the game has its own accept policy.
+    fn allow(&self, _peer: SteamId) {}
 }
 
 /// In-process stand-in for Steam: every `FakeSteam` on one net can message
@@ -52,6 +55,8 @@ struct FakeInner {
     inboxes: HashMap<SteamId, VecDeque<SteamEvent>>,
     down: bool,
     drop_unreliable: bool,
+    /// Sends left before one fails with `Full` (then it resets to None).
+    full_after: Option<usize>,
 }
 
 impl FakeSteamNet {
@@ -78,6 +83,19 @@ impl FakeSteamNet {
 
     pub fn restore(&self) {
         self.inner.lock().unwrap().down = false;
+    }
+
+    /// Only `at` sees its session with `remote` fail (the other side keeps
+    /// it, as when one end times out first).
+    pub fn fail_session(&self, at: SteamId, remote: SteamId) {
+        if let Some(q) = self.inner.lock().unwrap().inboxes.get_mut(&at) {
+            q.push_back(SteamEvent::SessionFailed { remote });
+        }
+    }
+
+    /// Let `n` more sends through, then refuse one with `Full`.
+    pub fn full_after(&self, n: usize) {
+        self.inner.lock().unwrap().full_after = Some(n);
     }
 
     /// Drop every unreliable message.
@@ -111,6 +129,14 @@ impl SteamBackend for FakeSteam {
         let mut i = self.net.inner.lock().unwrap();
         if i.down {
             return Err(SendError::NoConnection);
+        }
+        match i.full_after {
+            Some(0) => {
+                i.full_after = None;
+                return Err(SendError::Full);
+            }
+            Some(n) => i.full_after = Some(n - 1),
+            None => {}
         }
         if !reliable && i.drop_unreliable {
             return Ok(());
