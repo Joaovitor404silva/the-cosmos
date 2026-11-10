@@ -12,7 +12,7 @@ pub use discovery::{ConnLimits, ipfs_bootstrap, parse_list, provider_key};
 pub use libp2p::{Multiaddr, PeerId, Stream as P2pStream, identity::Keypair};
 pub use portguess::Plan as PortGuessPlan;
 pub use punch::{ADDR_TOPIC, ConnectError, decode_addrs, encode_addrs, verify_addr_record};
-pub use record::{CLOCK_SKEW, MAX_TTL, Record};
+pub use record::{CLOCK_SKEW, MAX_TTL, Record, now_secs};
 pub use rpc::{RpcLimits, RpcRequest, RpcStats};
 
 use anyhow::anyhow;
@@ -250,6 +250,7 @@ enum Command {
     Publish {
         topic: String,
         bytes: Vec<u8>,
+        ttl: Duration,
         reply: Reply<()>,
     },
     Find {
@@ -1067,7 +1068,14 @@ impl Node {
     }
 
     pub async fn publish(&self, topic: &str, data: Vec<u8>) -> anyhow::Result<()> {
-        let bytes = Record::sign(&self.keypair, topic, data, self.ttl)?;
+        self.publish_ttl(topic, data, self.ttl).await.map(|_| ())
+    }
+
+    /// `publish` with its own TTL (clamped to `MAX_TTL`); returns the signed
+    /// record that went out.
+    pub async fn publish_ttl(&self, topic: &str, data: Vec<u8>, ttl: Duration) -> anyhow::Result<Record> {
+        let ttl = ttl.min(MAX_TTL);
+        let bytes = Record::sign(&self.keypair, topic, data, ttl)?;
         {
             let mut own = self.own.lock().unwrap();
             if own.len() >= OWN_MAX && !own.contains_key(topic) {
@@ -1077,12 +1085,15 @@ impl Node {
                 own.insert(topic.to_string(), bytes.clone());
             }
         }
+        let rec = Record::verify(&bytes).ok_or_else(|| anyhow!("signed record does not verify"))?;
         self.call(|reply| Command::Publish {
             topic: topic.to_string(),
             bytes,
+            ttl,
             reply,
         })
-        .await
+        .await?;
+        Ok(rec)
     }
 
     pub async fn find(&self, topic: &str) -> anyhow::Result<Vec<Record>> {
@@ -1678,6 +1689,7 @@ impl EventLoop {
             Command::Publish {
                 topic,
                 bytes,
+                ttl,
                 reply,
             } => {
                 let _ = self
@@ -1689,7 +1701,7 @@ impl EventLoop {
                     key: record_key(&topic, &me),
                     value: bytes,
                     publisher: Some(me),
-                    expires: Some(std::time::Instant::now() + self.cfg.record_ttl),
+                    expires: Some(std::time::Instant::now() + ttl),
                 };
                 let k = &mut self.swarm.behaviour_mut().kad;
                 match k.put_record(rec, kad::Quorum::One) {

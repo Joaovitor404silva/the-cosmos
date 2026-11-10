@@ -12,6 +12,8 @@ pub struct Record {
     pub data: Vec<u8>,
     pub publisher: PeerId,
     pub expires: u64,
+    /// The exact signed bytes this record was verified from.
+    pub signed: Vec<u8>,
 }
 
 pub fn now_secs() -> u64 {
@@ -87,6 +89,7 @@ impl Record {
             data,
             publisher: key.to_peer_id(),
             expires,
+            signed: bytes.to_vec(),
         })
     }
 }
