@@ -20,6 +20,11 @@ pub enum TransportEvent {
     Frame { peer: PeerId, data: Vec<u8> },
     /// The path to `peer` is gone.
     Down { peer: PeerId },
+    /// Multi-path only: traffic to `peer` moved from path `from` to `to`.
+    PathSwitch { peer: PeerId, from: String, to: String },
+    /// Multi-path only: `peer` left too much reliable data unacknowledged
+    /// and was dropped.
+    Overflow { peer: PeerId },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +73,7 @@ struct MemInner {
     peers: HashMap<PeerId, mpsc::Sender<TransportEvent>>,
     loss_pct: u64,
     rng: u64,
+    cut: bool,
 }
 
 impl MemInner {
@@ -95,7 +101,12 @@ impl MemNet {
     }
 
     pub fn transport(self: &Arc<Self>) -> Arc<MemTransport> {
-        let me = PeerId::random();
+        self.transport_as(PeerId::random())
+    }
+
+    /// A transport with a given identity, so one peer can sit on several
+    /// networks (e.g. a "direct" and a "relay" `MemNet`).
+    pub fn transport_as(self: &Arc<Self>, me: PeerId) -> Arc<MemTransport> {
         let (tx, rx) = mpsc::channel(1 << 16);
         self.inner.lock().unwrap().peers.insert(me, tx);
         Arc::new(MemTransport {
@@ -103,6 +114,24 @@ impl MemNet {
             me,
             rx: Mutex::new(Some(rx)),
         })
+    }
+
+    /// Take the whole network down: frames in flight are lost silently,
+    /// connects fail, and every peer sees every path go down.
+    pub fn cut(&self) {
+        let mut i = self.inner.lock().unwrap();
+        i.cut = true;
+        let ids: Vec<PeerId> = i.peers.keys().copied().collect();
+        for (me, tx) in &i.peers {
+            for peer in ids.iter().filter(|p| *p != me) {
+                let _ = tx.try_send(TransportEvent::Down { peer: *peer });
+            }
+        }
+    }
+
+    /// Bring a `cut` network back.
+    pub fn restore(&self) {
+        self.inner.lock().unwrap().cut = false;
     }
 
     /// Simulate a crash: `peer` vanishes and everyone sees its path go down.
@@ -131,7 +160,10 @@ impl Transport for MemTransport {
     }
 
     fn connect(&self, peer: PeerId, _: Vec<Multiaddr>) -> BoxFuture<'_, anyhow::Result<()>> {
-        let ok = self.net.inner.lock().unwrap().peers.contains_key(&peer);
+        let ok = {
+            let i = self.net.inner.lock().unwrap();
+            !i.cut && i.peers.contains_key(&peer)
+        };
         async move {
             anyhow::ensure!(ok, "no path to {peer}");
             Ok(())
@@ -143,6 +175,9 @@ impl Transport for MemTransport {
         let mut i = self.net.inner.lock().unwrap();
         if !i.peers.contains_key(&self.me) {
             return Err(TransportError::Closed);
+        }
+        if i.cut {
+            return Ok(());
         }
         if !reliable && i.loss_pct > 0 && i.roll() < i.loss_pct {
             return Ok(());

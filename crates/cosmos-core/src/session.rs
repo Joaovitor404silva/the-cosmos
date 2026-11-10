@@ -47,6 +47,11 @@ pub enum SessionEvent {
     },
     /// The host left or vanished; the session is over.
     Ended,
+    /// Traffic to `peer` moved to another path (e.g. "relay" -> "direct").
+    PathSwitch { peer: PeerId, from: String, to: String },
+    /// `peer` left too much reliable data unacknowledged and was dropped;
+    /// `Left` (or `Ended` for the host) follows.
+    Overflow(PeerId),
 }
 
 #[derive(Debug)]
@@ -306,6 +311,17 @@ impl Inner {
         match ev {
             TransportEvent::Frame { peer, data } => self.on_frame(peer, data),
             TransportEvent::Down { peer } => self.drop_peer(peer),
+            TransportEvent::PathSwitch { peer, from, to } => {
+                if self.members.contains_key(&peer) {
+                    self.emit(SessionEvent::PathSwitch { peer, from, to });
+                }
+            }
+            TransportEvent::Overflow { peer } => {
+                if self.members.contains_key(&peer) {
+                    self.emit(SessionEvent::Overflow(peer));
+                }
+                self.drop_peer(peer);
+            }
         }
     }
 
