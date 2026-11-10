@@ -30,8 +30,8 @@ Spec: `docs/specs/2026-11-10-cosmos-sdk-design.md`. Workflow: unit TDD per task 
 - [x] Tests: namespace isolation, tamper rejection, TTL expiry, cap enforcement (`records.rs` unit tests, `tests/records.rs` on loopback nodes).
 
 ## M5 — C ABI
-- [ ] `cosmos-ffi` poll API per spec; cbindgen `cosmos.h`; C example (`examples/chat.c`) with 4 instances.
-- [ ] DLL builds for Windows x64; panic-safe boundary (test).
+- [x] `cosmos-ffi` poll API per spec; cbindgen `cosmos.h`; C example (`examples/chat.c`) with 4 instances. (`include/cosmos.h` checked in, `tests/header.rs` keeps it in sync; `tests/chat_c.rs` builds chat.c with MSVC and runs 4 instances in one process on loopback.)
+- [x] DLL builds for Windows x64; panic-safe boundary (test). (`cosmos.dll` + `cosmos.dll.lib` + static `cosmos.lib`; every export runs under `catch_unwind`, injected-panic test.)
 
 ## M6 — Cosmos Demo (example game, ships in the SDK)
 - [ ] `examples/cosmos-demo`, C + raylib: arena + stars + join code (sync), notes + ghosts (async), path HUD.

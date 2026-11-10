@@ -5,4 +5,18 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[lib]
+# cosmos.dll + cosmos.dll.lib (import lib) and cosmos.lib (static).
+name = "cosmos"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
 [dependencies]
+cosmos-core = { path = "../cosmos-core" }
+cosmos-net = { path = "../cosmos-net" }
+cosmos-steam = { path = "../cosmos-steam" }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time"] }
+futures = "0.3"
+tracing = "0.1"
+
+[dev-dependencies]
+cbindgen = { version = "0.29", default-features = false }

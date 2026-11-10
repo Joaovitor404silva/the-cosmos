@@ -696,7 +696,7 @@ async fn run(
 
 pub struct Session {
     shared: Arc<Shared>,
-    events: mpsc::Receiver<SessionEvent>,
+    events: Option<mpsc::Receiver<SessionEvent>>,
     task: JoinHandle<()>,
 }
 
@@ -740,7 +740,7 @@ impl Session {
         let shared = Arc::new(Shared { inner: Mutex::new(inner) });
         let (etx, events) = mpsc::channel(EVENT_QUEUE);
         let task = tokio::spawn(run(shared.clone(), rx, etx, join_done));
-        Ok(Session { shared, events, task })
+        Ok(Session { shared, events: Some(events), task })
     }
 
     /// Host a new session on `transport` (one session per transport).
@@ -806,16 +806,23 @@ impl Session {
         })
     }
 
+    /// `None` once `take_events` handed the receiver out.
     pub async fn next_event(&mut self) -> Option<SessionEvent> {
-        self.events.recv().await
+        self.events.as_mut()?.recv().await
     }
 
     pub fn try_event(&mut self) -> Option<SessionEvent> {
-        self.events.try_recv().ok()
+        self.events.as_mut()?.try_recv().ok()
+    }
+
+    /// Hand the event receiver to someone else (e.g. a pump task), so the
+    /// session can be shared for sending. Later `next_event` calls get `None`.
+    pub fn take_events(&mut self) -> Option<mpsc::Receiver<SessionEvent>> {
+        self.events.take()
     }
 
     /// Tell everyone we are leaving, flush, and end the session.
-    pub fn leave(self) {
+    pub fn leave(&self) {
         self.shared.with(Inner::leave);
     }
 }
@@ -1085,6 +1092,19 @@ mod tests {
         assert!(matches!(r, Err(JoinError::Timeout)), "joined although the host never admitted it");
         let m = Session::join(net.transport(), cfg, host.me(), vec![]).await.unwrap();
         assert!(host.members().contains(&m.me()), "join returned before the host admitted");
+    }
+
+    #[tokio::test]
+    async fn taken_events_flow_to_the_new_owner() {
+        let net = MemNet::new();
+        let mut host = Session::host(net.transport(), SessionConfig::default()).await.unwrap();
+        let mut rx = host.take_events().unwrap();
+        assert!(host.take_events().is_none());
+        let (m, _) = join(&net, &host).await;
+        assert_eq!(timeout(T, rx.recv()).await.unwrap(), Some(SessionEvent::Joined(m.me())));
+        assert_eq!(host.try_event(), None);
+        m.leave();
+        assert_eq!(timeout(T, rx.recv()).await.unwrap(), Some(SessionEvent::Left(m.me())));
     }
 
     #[test]
