@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/cosmos-core", "crates/cosmos-ffi", "crates/cosmos-steam"]
+members = ["crates/cosmos-core", "crates/cosmos-ffi", "crates/cosmos-net", "crates/cosmos-steam"]
 
 [workspace.package]
 version = "0.1.0"
