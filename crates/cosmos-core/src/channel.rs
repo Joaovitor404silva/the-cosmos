@@ -86,15 +86,20 @@ impl ChannelCaps {
         self
     }
 
+    /// Effective cap, clamped to `CAP_MAX` so peers with different settings
+    /// never produce frames the transport refuses.
     pub fn cap(&self, channel: Channel) -> usize {
-        *self.per_channel.get(&channel).unwrap_or(&self.default)
+        (*self.per_channel.get(&channel).unwrap_or(&self.default)).min(CAP_MAX)
     }
 
     /// Largest frame any channel can produce.
     pub fn max_frame(&self) -> usize {
-        HEADER + self.per_channel.values().copied().fold(self.default, usize::max).max(CTRL_CAP)
+        HEADER + self.per_channel.values().copied().fold(self.default, usize::max).max(CTRL_CAP).min(CAP_MAX)
     }
 }
+
+/// Largest payload any channel accepts, whatever the config says.
+pub const CAP_MAX: usize = 1 << 20;
 
 pub(crate) const CTRL_CAP: usize = 8 << 10;
 /// Ordered lanes hold at most this many frames ahead of the next expected one.
@@ -118,15 +123,29 @@ pub(crate) struct Lanes {
 
 impl Lanes {
     pub(crate) fn next_seq(&mut self, lane: Lane) -> u64 {
-        let s = self.tx.entry(lane).or_default();
-        *s += 1;
-        *s - 1
+        let s = self.peek_seq(lane);
+        self.commit_seq(lane);
+        s
+    }
+
+    /// Seq the next frame on `lane` will carry; `commit_seq` once it is sent,
+    /// so a refused send leaves no gap the receiver would wait on forever.
+    pub(crate) fn peek_seq(&self, lane: Lane) -> u64 {
+        self.tx.get(&lane).copied().unwrap_or(0)
+    }
+
+    pub(crate) fn commit_seq(&mut self, lane: Lane) {
+        *self.tx.entry(lane).or_default() += 1;
     }
 
     /// Feed one received frame. `None` marks a frame that was dropped (e.g.
     /// oversize) but still consumes its sequence number. Returns payloads now
     /// deliverable, in order.
     pub(crate) fn accept(&mut self, lane: Lane, seq: u64, payload: Option<Vec<u8>>) -> Vec<Vec<u8>> {
+        // u64::MAX is never sent; refusing it keeps `seq + 1` from overflowing.
+        if seq == u64::MAX {
+            return vec![];
+        }
         let rx = self.rx.entry(lane).or_default();
         if seq < rx.next {
             return vec![];
@@ -135,7 +154,7 @@ impl Lanes {
             rx.next = seq + 1;
             return payload.into_iter().collect();
         }
-        if seq >= rx.next + REORDER_WINDOW || rx.ahead.contains_key(&seq) {
+        if seq >= rx.next.saturating_add(REORDER_WINDOW) || rx.ahead.contains_key(&seq) {
             return vec![];
         }
         let size = payload.as_ref().map_or(0, Vec::len);
@@ -235,5 +254,26 @@ mod tests {
         let c = ChannelCaps::default().with(5, 100);
         assert_eq!(c.cap(5), 100);
         assert_eq!(c.cap(6), c.default);
+    }
+
+    #[test]
+    fn max_seq_does_not_overflow() {
+        let mut l = Lanes::default();
+        let u = Lane::Data(1, Delivery::Unreliable);
+        assert!(l.accept(u, u64::MAX, Some(vec![1])).is_empty());
+        assert_eq!(l.accept(u, 5, Some(vec![2])), vec![vec![2]]);
+        let r = Lane::Data(1, Delivery::Reliable);
+        assert!(l.accept(r, u64::MAX, Some(vec![1])).is_empty());
+        assert_eq!(l.accept(r, 0, Some(vec![3])), vec![vec![3]]);
+    }
+
+    #[test]
+    fn seq_advances_only_on_commit() {
+        let mut l = Lanes::default();
+        let r = Lane::Data(1, Delivery::Reliable);
+        assert_eq!(l.peek_seq(r), 0);
+        assert_eq!(l.peek_seq(r), 0);
+        l.commit_seq(r);
+        assert_eq!(l.peek_seq(r), 1);
     }
 }

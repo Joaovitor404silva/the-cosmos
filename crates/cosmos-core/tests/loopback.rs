@@ -55,8 +55,8 @@ async fn start(boot: Option<Multiaddr>) -> Node {
     n
 }
 
-fn transport(n: &Node, cfg: &SessionConfig) -> std::sync::Arc<NetTransport> {
-    NetTransport::new(n.clone(), cfg.caps.max_frame()).unwrap()
+fn transport(n: &Node, _cfg: &SessionConfig) -> std::sync::Arc<NetTransport> {
+    NetTransport::new(n.clone()).unwrap()
 }
 
 async fn joined(s: &mut Session, n: usize) {
@@ -92,10 +92,13 @@ async fn four_peers_join_by_code_and_exchange_1k_in_order() {
     }
     let fifth = nodes.pop().unwrap();
 
-    let mut host = Session::host(transport(&host_node, &cfg), cfg.clone()).await.unwrap();
     let addrs = host_node.listen_addrs().await;
     let adv = retry("advertise", || code::advertise(&host_node, NS, addrs.clone())).await;
     let code = code::pretty(&adv.code);
+    // Host admits only code holders; joiners derive the secret from the code.
+    assert_eq!(adv.secret, code::join_secret(NS, &adv.code));
+    let cfg = SessionConfig { join_secret: Some(adv.secret), ..cfg };
+    let mut host = Session::host(transport(&host_node, &cfg), cfg.clone()).await.unwrap();
 
     // The 5th node also publishes a forged advert under the same topic: it
     // copies the host id and real salt but points at its own addresses.

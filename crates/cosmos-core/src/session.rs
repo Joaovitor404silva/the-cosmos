@@ -23,6 +23,9 @@ pub struct SessionConfig {
     pub max_peers: usize,
     pub caps: ChannelCaps,
     pub join_timeout: Duration,
+    /// Host: admit only joiners presenting this (`code::join_secret`).
+    /// Joiner: the secret to present. `None` on the host admits anyone.
+    pub join_secret: Option<[u8; 16]>,
 }
 
 impl Default for SessionConfig {
@@ -31,6 +34,7 @@ impl Default for SessionConfig {
             max_peers: MAX_PEERS,
             caps: ChannelCaps::default(),
             join_timeout: Duration::from_secs(30),
+            join_secret: None,
         }
     }
 }
@@ -100,6 +104,8 @@ impl std::error::Error for SendError {}
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SessionStats {
     pub rejected_full: u64,
+    /// Joins dropped for a missing or wrong join secret.
+    pub rejected_secret: u64,
     pub dropped_oversize: u64,
     pub dropped_malformed: u64,
     pub dropped_stranger: u64,
@@ -114,7 +120,7 @@ const TICK: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Ctrl {
-    Join { addrs: Vec<Multiaddr> },
+    Join { addrs: Vec<Multiaddr>, secret: Option<[u8; 16]> },
     Welcome { members: Vec<(PeerId, Vec<Multiaddr>)> },
     Reject,
     Ready,
@@ -175,9 +181,16 @@ impl Ctrl {
     fn encode(&self) -> Vec<u8> {
         let mut w = W(vec![]);
         match self {
-            Ctrl::Join { addrs } => {
+            Ctrl::Join { addrs, secret } => {
                 w.0.push(1);
                 w.addrs(addrs);
+                match secret {
+                    Some(s) => {
+                        w.0.push(1);
+                        w.0.extend_from_slice(s);
+                    }
+                    None => w.0.push(0),
+                }
             }
             Ctrl::Welcome { members } => {
                 w.0.push(2);
@@ -206,7 +219,15 @@ impl Ctrl {
     fn decode(b: &[u8]) -> Option<Ctrl> {
         let mut r = R(b);
         let c = match r.u8()? {
-            1 => Ctrl::Join { addrs: r.addrs()? },
+            1 => {
+                let addrs = r.addrs()?;
+                let secret = match r.u8()? {
+                    0 => None,
+                    1 => Some(r.take(16)?.try_into().ok()?),
+                    _ => return None,
+                };
+                Ctrl::Join { addrs, secret }
+            }
             2 => {
                 let n = r.u8()? as usize;
                 if n >= MAX_PEERS {
@@ -265,8 +286,14 @@ struct Inner {
     /// Sequence state; present exactly for peers we exchange frames with.
     lanes: HashMap<PeerId, Lanes>,
     strangers: HashMap<PeerId, Stranger>,
+    /// Joiner: mesh connected and `Ready` sent.
+    mesh_ready: bool,
     stats: SessionStats,
     out: Vec<Action>,
+}
+
+fn ct_eq(a: &[u8; 16], b: &[u8; 16]) -> bool {
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 impl Inner {
@@ -275,9 +302,11 @@ impl Inner {
     }
 
     fn send_ctrl(&mut self, peer: PeerId, c: &Ctrl) {
-        let seq = self.lanes.entry(peer).or_default().next_seq(Lane::Ctrl);
-        if let Err(e) = self.transport.send(peer, encode(Lane::Ctrl, seq, &c.encode()), true) {
-            tracing::debug!(%peer, "ctrl send failed: {e}");
+        let lanes = self.lanes.entry(peer).or_default();
+        let seq = lanes.peek_seq(Lane::Ctrl);
+        match self.transport.send(peer, encode(Lane::Ctrl, seq, &c.encode()), true) {
+            Ok(()) => lanes.commit_seq(Lane::Ctrl),
+            Err(e) => tracing::debug!(%peer, "ctrl send failed: {e}"),
         }
     }
 
@@ -287,8 +316,10 @@ impl Inner {
     }
 
     fn send(&mut self, to: PeerId, channel: Channel, data: &[u8], d: Delivery) -> Result<(), SendError> {
-        if self.role == Role::Ended {
-            return Err(SendError::Ended);
+        match self.role {
+            Role::Ended => return Err(SendError::Ended),
+            Role::Joining => return Err(SendError::NotMember),
+            Role::Host | Role::Member => {}
         }
         if !self.members.contains_key(&to) {
             return Err(SendError::NotMember);
@@ -298,13 +329,16 @@ impl Inner {
             return Err(SendError::TooLarge { size: data.len(), cap });
         }
         let lane = Lane::Data(channel, d);
-        let seq = self.lanes.entry(to).or_default().next_seq(lane);
+        let lanes = self.lanes.entry(to).or_default();
+        let seq = lanes.peek_seq(lane);
         self.transport
             .send(to, encode(lane, seq, data), d == Delivery::Reliable)
             .map_err(|e| match e {
                 TransportError::Backlog => SendError::Backlog,
                 TransportError::Closed => SendError::NotMember,
-            })
+            })?;
+        lanes.commit_seq(lane);
+        Ok(())
     }
 
     fn on_transport(&mut self, ev: TransportEvent) {
@@ -363,15 +397,22 @@ impl Inner {
         match self.role {
             Role::Host if lane == Lane::Ctrl && seq == 0 => {
                 match channel::decode(&data).and_then(|(_, _, p)| Ctrl::decode(p)) {
-                    Some(Ctrl::Join { addrs }) => self.on_join(peer, addrs),
-                    _ => self.stats.dropped_stranger += 1,
+                    Some(Ctrl::Join { addrs, secret }) => self.on_join(peer, addrs, secret),
+                    _ => {
+                        self.stats.dropped_stranger += 1;
+                        self.transport.disconnect(peer);
+                    }
                 }
             }
             // A member may hear from a newcomer before the host's `Joined`.
             Role::Member | Role::Joining => {
-                if !self.strangers.contains_key(&peer) && self.strangers.len() >= STRANGER_PEERS {
+                // Full: evict the oldest, so junk can't lock out a real newcomer.
+                if !self.strangers.contains_key(&peer)
+                    && self.strangers.len() >= STRANGER_PEERS
+                    && let Some(old) = self.strangers.iter().min_by_key(|(_, s)| s.since).map(|(p, _)| *p)
+                {
+                    self.strangers.remove(&old);
                     self.stats.dropped_stranger += 1;
-                    return;
                 }
                 let s = self.strangers.entry(peer).or_insert_with(|| Stranger {
                     bytes: 0,
@@ -385,11 +426,22 @@ impl Inner {
                 s.bytes += data.len();
                 s.frames.push(data);
             }
-            _ => self.stats.dropped_stranger += 1,
+            _ => {
+                self.stats.dropped_stranger += 1;
+                self.transport.disconnect(peer);
+            }
         }
     }
 
-    fn on_join(&mut self, peer: PeerId, addrs: Vec<Multiaddr>) {
+    fn on_join(&mut self, peer: PeerId, addrs: Vec<Multiaddr>, secret: Option<[u8; 16]>) {
+        if let Some(want) = self.cfg.join_secret
+            && !secret.is_some_and(|s| ct_eq(&s, &want))
+        {
+            // Silent: no answer tells a guesser anything.
+            self.stats.rejected_secret += 1;
+            self.transport.disconnect(peer);
+            return;
+        }
         if 1 + self.members.len() + self.pending.len() >= self.cfg.max_peers.min(MAX_PEERS) {
             self.stats.rejected_full += 1;
             let seq = Lanes::default().next_seq(Lane::Ctrl);
@@ -411,7 +463,9 @@ impl Inner {
         match (self.role, c) {
             (Role::Host, Ctrl::Ready) => {
                 if let Some((addrs, _)) = self.pending.remove(&from) {
-                    for p in self.audience() {
+                    // `from` is no longer in the audience; its copy is the
+                    // admission it waits for before reporting success.
+                    for p in self.audience().into_iter().chain([from]) {
                         self.send_ctrl(p, &Ctrl::Joined { peer: from, addrs: addrs.clone() });
                     }
                     self.members.insert(from, addrs);
@@ -430,6 +484,20 @@ impl Inner {
             (Role::Joining, Ctrl::Reject) if from_host => {
                 self.role = Role::Ended;
                 self.out.push(Action::JoinDone(Err(JoinError::Full)));
+            }
+            (Role::Joining, Ctrl::Joined { peer, .. }) if from_host && peer == self.me => {
+                if !self.mesh_ready {
+                    self.stats.dropped_malformed += 1;
+                    return;
+                }
+                self.role = Role::Member;
+                let host = self.host;
+                self.emit(SessionEvent::Joined(host));
+                let others: Vec<_> = self.members.keys().filter(|p| **p != host).copied().collect();
+                for p in others {
+                    self.emit(SessionEvent::Joined(p));
+                }
+                self.out.push(Action::JoinDone(Ok(())));
             }
             (Role::Joining | Role::Member, Ctrl::Joined { peer, addrs }) if from_host => {
                 if peer == self.me || self.members.contains_key(&peer) {
@@ -468,15 +536,10 @@ impl Inner {
         }
         let host = self.host;
         match r {
+            // Not in yet: the host's `Joined { peer: me }` admits us.
             Ok(()) => {
-                self.role = Role::Member;
+                self.mesh_ready = true;
                 self.send_ctrl(host, &Ctrl::Ready);
-                self.emit(SessionEvent::Joined(host));
-                let others: Vec<_> = self.members.keys().filter(|p| **p != host).copied().collect();
-                for p in others {
-                    self.emit(SessionEvent::Joined(p));
-                }
-                self.out.push(Action::JoinDone(Ok(())));
             }
             Err(e) => {
                 self.send_ctrl(host, &Ctrl::Leave);
@@ -488,6 +551,7 @@ impl Inner {
 
     fn drop_peer(&mut self, peer: PeerId) {
         self.strangers.remove(&peer);
+        self.transport.disconnect(peer);
         if self.role == Role::Host {
             if self.pending.remove(&peer).is_some() {
                 self.lanes.remove(&peer);
@@ -665,11 +729,13 @@ impl Session {
             pending: HashMap::new(),
             lanes: HashMap::new(),
             strangers: HashMap::new(),
+            mesh_ready: false,
             stats: SessionStats::default(),
             out: vec![],
         };
         if let Some(h) = host {
-            inner.send_ctrl(h, &Ctrl::Join { addrs: my_addrs });
+            let secret = inner.cfg.join_secret;
+            inner.send_ctrl(h, &Ctrl::Join { addrs: my_addrs, secret });
         }
         let shared = Arc::new(Shared { inner: Mutex::new(inner) });
         let (etx, events) = mpsc::channel(EVENT_QUEUE);
@@ -922,5 +988,109 @@ mod tests {
             .unwrap();
         assert!(timeout(Duration::from_millis(300), host.next_event()).await.is_err());
         assert_eq!(host.stats().dropped_stranger, 1);
+    }
+
+    /// MemTransport wrapper: can fail the next send (Backlog) or silently
+    /// swallow the n-th reliable send to one peer.
+    struct Flaky {
+        inner: Arc<MemTransport>,
+        fail_next: std::sync::atomic::AtomicBool,
+        swallow: Mutex<Option<(PeerId, usize)>>,
+    }
+
+    impl Flaky {
+        fn new(inner: Arc<MemTransport>) -> Arc<Self> {
+            Arc::new(Flaky { inner, fail_next: false.into(), swallow: Mutex::new(None) })
+        }
+    }
+
+    impl Transport for Flaky {
+        fn local_peer(&self) -> PeerId {
+            self.inner.local_peer()
+        }
+        fn local_addrs(&self) -> futures::future::BoxFuture<'_, Vec<Multiaddr>> {
+            self.inner.local_addrs()
+        }
+        fn connect(&self, peer: PeerId, addrs: Vec<Multiaddr>) -> futures::future::BoxFuture<'_, anyhow::Result<()>> {
+            self.inner.connect(peer, addrs)
+        }
+        fn send(&self, peer: PeerId, frame: Vec<u8>, reliable: bool) -> Result<(), TransportError> {
+            if self.fail_next.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                return Err(TransportError::Backlog);
+            }
+            if reliable {
+                let mut sw = self.swallow.lock().unwrap();
+                if let Some((p, n)) = sw.as_mut()
+                    && *p == peer
+                {
+                    if *n == 0 {
+                        *sw = None;
+                        return Ok(());
+                    }
+                    *n -= 1;
+                }
+            }
+            self.inner.send(peer, frame, reliable)
+        }
+        fn disconnect(&self, peer: PeerId) {
+            self.inner.disconnect(peer)
+        }
+        fn take_events(&self) -> Option<mpsc::Receiver<TransportEvent>> {
+            self.inner.take_events()
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_send_does_not_stall_the_lane() {
+        let net = MemNet::new();
+        let mut host = Session::host(net.transport(), SessionConfig::default()).await.unwrap();
+        let f = Flaky::new(net.transport());
+        let mut m = Session::join(f.clone(), SessionConfig::default(), host.me(), vec![]).await.unwrap();
+        assert_eq!(ev(&mut host).await, SessionEvent::Joined(m.me()));
+        assert_eq!(ev(&mut m).await, SessionEvent::Joined(host.me()));
+        f.fail_next.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(m.send(host.me(), 1, b"lost", Delivery::Reliable), Err(SendError::Backlog));
+        m.send(host.me(), 1, b"after", Delivery::Reliable).unwrap();
+        assert_eq!(
+            ev(&mut host).await,
+            SessionEvent::Message { from: m.me(), channel: 1, delivery: Delivery::Reliable, data: b"after".to_vec() }
+        );
+    }
+
+    #[tokio::test]
+    async fn join_needs_the_code_secret() {
+        let net = MemNet::new();
+        let cfg = SessionConfig { join_secret: Some([7; 16]), join_timeout: Duration::from_millis(800), ..SessionConfig::default() };
+        let host = Session::host(net.transport(), cfg.clone()).await.unwrap();
+        for wrong in [None, Some([8; 16])] {
+            let bad = SessionConfig { join_secret: wrong, ..cfg.clone() };
+            let r = Session::join(net.transport(), bad, host.me(), vec![]).await;
+            assert!(matches!(r, Err(JoinError::Timeout)), "joined without the secret: {:?}", r.err());
+        }
+        assert!(host.members().is_empty());
+        assert_eq!(host.stats().rejected_secret, 2);
+        let ok = Session::join(net.transport(), cfg, host.me(), vec![]).await;
+        assert!(ok.is_ok(), "{:?}", ok.err());
+    }
+
+    #[tokio::test]
+    async fn join_completes_only_after_the_host_admits() {
+        let net = MemNet::new();
+        let cfg = SessionConfig { join_timeout: Duration::from_millis(800), ..SessionConfig::default() };
+        let host = Session::host(net.transport(), cfg.clone()).await.unwrap();
+        let f = Flaky::new(net.transport());
+        // Swallow the joiner's 2nd reliable frame to the host: `Ready`.
+        *f.swallow.lock().unwrap() = Some((host.me(), 1));
+        let r = Session::join(f, cfg.clone(), host.me(), vec![]).await;
+        assert!(matches!(r, Err(JoinError::Timeout)), "joined although the host never admitted it");
+        let m = Session::join(net.transport(), cfg, host.me(), vec![]).await.unwrap();
+        assert!(host.members().contains(&m.me()), "join returned before the host admitted");
+    }
+
+    #[test]
+    fn caps_are_clamped_to_the_transport_ceiling() {
+        let caps = ChannelCaps::default().with(1, usize::MAX);
+        assert_eq!(caps.cap(1), channel::CAP_MAX);
+        assert!(caps.max_frame() <= crate::transport::FRAME_MAX);
     }
 }
