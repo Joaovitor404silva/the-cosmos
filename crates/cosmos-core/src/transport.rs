@@ -282,10 +282,10 @@ impl NetShared {
 
     fn writer(self: &Arc<Self>, peer: PeerId) -> (mpsc::UnboundedSender<Vec<u8>>, Arc<AtomicUsize>) {
         let mut w = self.writers.lock().unwrap();
-        if let Some(x) = w.get(&peer) {
-            if !x.tx.is_closed() {
-                return (x.tx.clone(), x.queued.clone());
-            }
+        if let Some(x) = w.get(&peer)
+            && !x.tx.is_closed()
+        {
+            return (x.tx.clone(), x.queued.clone());
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) as u64;
         let (tx, rx) = mpsc::unbounded_channel();
