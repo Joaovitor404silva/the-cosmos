@@ -14,9 +14,9 @@ Spec: `docs/specs/2026-11-10-cosmos-sdk-design.md`. Workflow: unit TDD per task 
 - [x] Loopback 4-peer integration test: all pairs exchange 1k msgs.
 
 ## M2 — Path migration
-- [ ] Channel layer with sequence numbers independent of the path.
-- [ ] Background direct retry while relayed; migrate on success, fall back on loss.
-- [ ] Test: start on a Steam-relay test double, open direct, no lost/duplicated reliable messages across the switch; then kill direct → back to Steam relay.
+- [x] Channel layer with sequence numbers independent of the path.
+- [x] Background direct retry while relayed; migrate on success, fall back on loss.
+- [x] Test: start on a Steam-relay test double, open direct, no lost/duplicated reliable messages across the switch; then kill direct → back to Steam relay.
 
 ## M3 — Steam path
 - [ ] Dynamic load of bundled `steam_api64.dll`: reuse the game's in-process Steam if present, else init with AppID 480 (configurable). Steam client not running = path off, no error.
