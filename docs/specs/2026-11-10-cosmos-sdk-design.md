@@ -56,7 +56,7 @@ int        cosmos_host(cosmos_t*, char code_out[12]);  // join code
 int        cosmos_join(cosmos_t*, const char* code);
 int        cosmos_send(cosmos_t*, peer_t to, uint8_t chan, const void*, size_t, int reliable);
 int        cosmos_poll(cosmos_t*, cosmos_event_t* ev); // peer joined/left, msg, path changed
-int        cosmos_record_put(cosmos_t*, const char* kind, const void*, size_t, uint32_t ttl_s);
+int        cosmos_record_put(cosmos_t*, const char* kind, const char* key, const void*, size_t, uint32_t ttl_s);
 int        cosmos_record_query(cosmos_t*, const char* kind, const char* key, uint32_t req_id);
 void       cosmos_shutdown(cosmos_t*);
 ```

@@ -199,12 +199,64 @@ async fn disk_cache_survives_restart() {
         let ra = Records::new(a.clone(), with_dir()).unwrap();
         put(&ra, "profile", "me", b"level 12", Duration::from_secs(600)).await;
     }
-    std::fs::write(dir.0.join("garbage.rec"), b"not a record").unwrap();
-    std::fs::write(dir.0.join("0000.rec"), []).unwrap();
+    let ours = dir.0.join("game");
+    std::fs::write(ours.join(format!("{}.rec", "0".repeat(32))), b"not a record").unwrap();
+    std::fs::write(ours.join(format!("{}.rec", "1".repeat(32))), []).unwrap();
     let lone = Node::start(base()).await.unwrap();
     let r = Records::new(lone, with_dir()).unwrap();
     let got = r.cached("profile", "me");
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].publisher, a.peer_id());
     assert_eq!(got[0].data, b"level 12");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn newer_put_replaces_older_even_with_shorter_ttl() {
+    let (c, a, b) = mesh3().await;
+    let ra = Records::new(a.clone(), cfg("game")).unwrap();
+    let rb = Records::new(b.clone(), cfg("game")).unwrap();
+    let mut sub = rb.subscribe("note", "upd").unwrap();
+    a.connect(b.peer_id()).await.unwrap();
+    // Long-lived v1, then a short-lived v2 and v3 in the same second.
+    put(&ra, "note", "upd", b"v1", MAX_TTL).await;
+    assert_eq!(query_until(&rb, "note", "upd", 1).await[0].data, b"v1");
+    put(&ra, "note", "upd", b"v2", Duration::from_secs(60)).await;
+    put(&ra, "note", "upd", b"v3", Duration::from_secs(60)).await;
+    let start = Instant::now();
+    loop {
+        let got = rb.query("note", "upd").await.unwrap();
+        if got.len() == 1 && got[0].data == b"v3" {
+            break;
+        }
+        assert!(start.elapsed() < Duration::from_secs(20), "remote kept {:?}", got.iter().map(|e| e.data.clone()).collect::<Vec<_>>());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    let rc = Records::new(c.clone(), cfg("game")).unwrap();
+    assert_eq!(query_until(&rc, "note", "upd", 1).await[0].data, b"v3", "third node got a stale copy");
+    // The subscription saw v3 last.
+    let mut last = None;
+    while let Ok(Some(e)) = timeout(Duration::from_millis(500), sub.next()).await {
+        last = Some(e.data);
+    }
+    assert_eq!(last.as_deref(), Some(&b"v3"[..]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dropped_subscription_leaves_the_gossip_topic() {
+    let (_c, a, _b) = mesh3().await;
+    let ra = Records::new(a.clone(), cfg("game")).unwrap();
+    let t = cosmos_core::records::topic("game", "ghost", "room9").unwrap();
+    let s1 = ra.subscribe("ghost", "room9").unwrap();
+    let s2 = ra.subscribe("ghost", "room9").unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(a.gossip_topics().await.contains(&t));
+    drop(s1);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(a.gossip_topics().await.contains(&t), "left while still subscribed");
+    drop(s2);
+    let start = Instant::now();
+    while a.gossip_topics().await.contains(&t) {
+        assert!(start.elapsed() < Duration::from_secs(5), "never left the topic");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }

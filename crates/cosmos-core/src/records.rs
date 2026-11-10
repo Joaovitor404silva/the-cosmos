@@ -11,9 +11,14 @@
 //! - TTL is clamped to `MAX_TTL`; expired records are never returned.
 //! - Caps: record size, puts per window, records/bytes per query result and
 //!   per subscription buffer (oldest dropped first).
-//! - A bounded cache keeps recently seen records, optionally on disk (one
-//!   file of signed bytes per record); unreadable or invalid files are
-//!   ignored and removed.
+//! - The newest record of a publisher wins, by its signed issue time (not
+//!   its expiry), so an update with a shorter TTL still replaces the old one
+//!   and a replayed older record never does.
+//! - A bounded cache keeps recently seen records, optionally on disk under
+//!   `cache_dir/<namespace>/` (one file of signed bytes per record, written
+//!   by a background thread). A flood on one topic evicts from that topic
+//!   first; our own records are evicted last. Invalid files in that folder
+//!   are removed; nothing outside it is touched.
 
 use cosmos_net::{MAX_TTL, Node, PeerId, Record, now_secs};
 use futures::StreamExt;
@@ -21,6 +26,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
@@ -47,7 +53,7 @@ pub struct RecordsConfig {
     /// Caps on what one subscription buffers before it is read.
     pub sub_max_records: usize,
     pub sub_max_bytes: usize,
-    /// Keep recently seen records here across restarts.
+    /// Keep recently seen records across restarts, in `cache_dir/<namespace>`.
     pub cache_dir: Option<PathBuf>,
     pub cache_max_records: usize,
 }
@@ -100,6 +106,8 @@ pub struct Entry {
     pub key: String,
     pub publisher: PeerId,
     pub data: Vec<u8>,
+    /// Unix milliseconds when the publisher signed it (newer = larger).
+    pub issued: u64,
     /// Unix seconds.
     pub expires: u64,
 }
@@ -137,6 +145,7 @@ fn admit(ns: &str, rec: &Record, max: usize, now: u64) -> Option<Entry> {
         key: key.to_string(),
         publisher: rec.publisher,
         data: rec.data.clone(),
+        issued: rec.issued,
         expires: rec.expires,
     })
 }
@@ -159,63 +168,108 @@ fn file_name(topic: &str, publisher: &PeerId) -> String {
     format!("{hex}.rec")
 }
 
+fn is_cache_name(n: &str) -> bool {
+    n.len() == 36 && n.ends_with(".rec") && n[..32].bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+enum DiskOp {
+    Write(String, Vec<u8>),
+    Remove(String),
+    #[cfg(test)]
+    Flush(std::sync::mpsc::Sender<()>),
+}
+
+/// Applies disk ops off the async runtime, coalescing bursts per file.
+fn disk_writer(dir: PathBuf, rx: Receiver<DiskOp>) {
+    while let Ok(op) = rx.recv() {
+        let mut batch: HashMap<String, Option<Vec<u8>>> = HashMap::new();
+        #[allow(unused_mut)]
+        let mut flushed: Vec<std::sync::mpsc::Sender<()>> = Vec::new();
+        for op in std::iter::once(op).chain(rx.try_iter()) {
+            match op {
+                DiskOp::Write(n, b) => drop(batch.insert(n, Some(b))),
+                DiskOp::Remove(n) => drop(batch.insert(n, None)),
+                #[cfg(test)]
+                DiskOp::Flush(tx) => flushed.push(tx),
+            }
+        }
+        for (n, b) in batch {
+            let _ = match b {
+                Some(b) => std::fs::write(dir.join(n), b),
+                None => std::fs::remove_file(dir.join(n)),
+            };
+        }
+        for tx in flushed.drain(..) {
+            let _ = tx.send(());
+        }
+    }
+}
+
 /// Recently seen records of one namespace, bounded, optionally on disk.
 struct Cache {
     ns: String,
+    me: PeerId,
     max_bytes: usize,
     max_records: usize,
-    dir: Option<PathBuf>,
+    disk: Option<SyncSender<DiskOp>>,
     map: HashMap<(String, PeerId), (Entry, Vec<u8>)>,
 }
 
 impl Cache {
-    fn open(ns: &str, max_bytes: usize, max_records: usize, dir: Option<PathBuf>) -> Cache {
-        let mut c = Cache { ns: ns.to_string(), max_bytes, max_records, dir, map: HashMap::new() };
-        c.load(now_secs());
+    fn open(ns: &str, me: PeerId, max_bytes: usize, max_records: usize, dir: Option<PathBuf>) -> Cache {
+        let mut c = Cache { ns: ns.to_string(), me, max_bytes, max_records, disk: None, map: HashMap::new() };
+        if let Some(dir) = dir.map(|d| d.join(ns))
+            && std::fs::create_dir_all(&dir).is_ok()
+        {
+            c.load(&dir, now_secs());
+            let (tx, rx) = sync_channel(4096);
+            let d = dir.clone();
+            if std::thread::Builder::new().name("cosmos-rec-disk".into()).spawn(move || disk_writer(d, rx)).is_ok() {
+                c.disk = Some(tx);
+            }
+        }
         c
     }
 
-    fn load(&mut self, now: u64) {
-        let Some(dir) = self.dir.clone() else { return };
-        let _ = std::fs::create_dir_all(&dir);
-        let Ok(rd) = std::fs::read_dir(&dir) else { return };
+    /// Load `dir` (ours alone). Files that don't hold a live record of this
+    /// namespace under their own name are removed; other names are left.
+    fn load(&mut self, dir: &std::path::Path, now: u64) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
         let limit = (self.max_bytes + OVERHEAD) as u64;
-        for ent in rd.flatten().take(self.max_records.saturating_mul(4)) {
+        let ours = rd
+            .flatten()
+            .filter(|e| e.file_name().to_str().is_some_and(is_cache_name))
+            .take(self.max_records.saturating_mul(4).max(16));
+        for ent in ours {
             let path = ent.path();
-            if path.extension().is_none_or(|x| x != "rec") {
-                continue;
-            }
             let bytes = match ent.metadata() {
                 Ok(m) if m.is_file() && m.len() <= limit => std::fs::read(&path).ok(),
                 _ => None,
             };
-            let rec = bytes.as_deref().and_then(Record::verify);
-            match rec {
-                // Another game's record sharing the dir: leave it alone.
-                Some(r) if !r.topic.starts_with(&prefix(&self.ns)) && r.expires > now => continue,
-                Some(r) if path.file_name().and_then(|n| n.to_str()) == Some(&file_name(&r.topic, &r.publisher)) => {
-                    match admit(&self.ns, &r, self.max_bytes, now) {
-                        Some(e) => {
-                            self.insert_mem(r, e, now, false);
-                        }
-                        None => {
-                            let _ = std::fs::remove_file(&path);
-                        }
+            let named = |r: &Record| ent.file_name().to_str() == Some(&file_name(&r.topic, &r.publisher));
+            let ok = bytes
+                .as_deref()
+                .and_then(Record::verify)
+                .filter(named)
+                .and_then(|r| admit(&self.ns, &r, self.max_bytes, now).map(|e| (r, e)));
+            match ok {
+                Some((r, e)) => {
+                    for f in self.insert_mem(r, e, now) {
+                        let _ = std::fs::remove_file(dir.join(f));
                     }
                 }
-                _ => {
+                None => {
                     let _ = std::fs::remove_file(&path);
                 }
             }
         }
     }
 
-    /// Keep `(rec, e)` if newer than what we have; evict to stay bounded.
-    /// Returns the evicted entries' file names.
-    /// `force` replaces even a longer-lived copy (our own fresh put).
-    fn insert_mem(&mut self, rec: Record, e: Entry, now: u64, force: bool) -> Vec<String> {
+    /// Keep `(rec, e)` if newer than what we have from that publisher;
+    /// evict to stay bounded. Returns the evicted entries' file names.
+    fn insert_mem(&mut self, rec: Record, e: Entry, now: u64) -> Vec<String> {
         let id = (rec.topic.clone(), rec.publisher);
-        if !force && self.map.get(&id).is_some_and(|(old, _)| old.expires >= e.expires) {
+        if self.map.get(&id).is_some_and(|(old, _)| old.issued >= e.issued) {
             return vec![];
         }
         self.map.insert(id, (e, rec.signed));
@@ -230,24 +284,61 @@ impl Cache {
             });
         }
         while self.map.len() > self.max_records {
-            let oldest = self.map.iter().min_by_key(|(_, (e, _))| e.expires).map(|(k, _)| k.clone()).unwrap();
-            gone.push(file_name(&oldest.0, &oldest.1));
-            self.map.remove(&oldest);
+            let k = self.victim();
+            gone.push(file_name(&k.0, &k.1));
+            self.map.remove(&k);
         }
         gone
     }
 
-    fn insert(&mut self, rec: &Record, e: &Entry, force: bool) {
+    /// Oldest foreign record of the topic holding the most foreign records
+    /// (so a flood on one topic pays for itself); our own only when nothing
+    /// else is left.
+    fn victim(&self) -> (String, PeerId) {
+        let mut per: HashMap<&str, usize> = HashMap::new();
+        for (t, p) in self.map.keys() {
+            if *p != self.me {
+                *per.entry(t).or_default() += 1;
+            }
+        }
+        // Ties between topics go to the oldest record among them.
+        let top = per.values().copied().max();
+        self.map
+            .iter()
+            .filter(|((t, p), _)| top.is_none_or(|n| *p != self.me && per[t.as_str()] == n))
+            .min_by_key(|(k, (e, _))| (e.issued, k.1))
+            .map(|(k, _)| k.clone())
+            .unwrap()
+    }
+
+    fn send(&self, op: DiskOp) {
+        if let Some(tx) = &self.disk
+            && let Err(TrySendError::Full(_)) = tx.try_send(op)
+        {
+            tracing::debug!("record cache disk queue full; op dropped");
+        }
+    }
+
+    fn insert(&mut self, rec: &Record, e: &Entry) {
         let id = (rec.topic.clone(), rec.publisher);
-        let now = now_secs();
-        let gone = self.insert_mem(rec.clone(), e.clone(), now, force);
-        let Some(dir) = &self.dir else { return };
+        let gone = self.insert_mem(rec.clone(), e.clone(), now_secs());
+        if self.disk.is_none() {
+            return;
+        }
         for f in gone {
-            let _ = std::fs::remove_file(dir.join(f));
+            self.send(DiskOp::Remove(f));
         }
         if self.map.get(&id).is_some_and(|(kept, _)| kept == e) {
-            let _ = std::fs::create_dir_all(dir);
-            let _ = std::fs::write(dir.join(file_name(&rec.topic, &rec.publisher)), &rec.signed);
+            self.send(DiskOp::Write(file_name(&rec.topic, &rec.publisher), rec.signed.clone()));
+        }
+    }
+
+    #[cfg(test)]
+    fn flush(&self) {
+        if let Some(tx) = &self.disk {
+            let (ftx, frx) = std::sync::mpsc::channel();
+            tx.send(DiskOp::Flush(ftx)).unwrap();
+            frx.recv().unwrap();
         }
     }
 
@@ -281,8 +372,10 @@ impl Rate {
 }
 
 /// Freshest first, then cut at `max_records` / `max_bytes`.
+/// Issue times past now (clock skew) rank as now.
 fn cap(mut v: Vec<Entry>, max_records: usize, max_bytes: usize) -> Vec<Entry> {
-    v.sort_by(|a, b| b.expires.cmp(&a.expires));
+    let now = cosmos_net::now_ms();
+    v.sort_by(|a, b| b.issued.min(now).cmp(&a.issued.min(now)));
     let mut bytes = 0usize;
     let mut out = Vec::new();
     for e in v {
@@ -307,7 +400,7 @@ impl Records {
         if !name_ok(&cfg.namespace) {
             return Err(RecordError::BadName);
         }
-        let cache = Cache::open(&cfg.namespace, cfg.max_record_bytes, cfg.cache_max_records, cfg.cache_dir.clone());
+        let cache = Cache::open(&cfg.namespace, node.peer_id(), cfg.max_record_bytes, cfg.cache_max_records, cfg.cache_dir.clone());
         Ok(Records {
             node,
             rate: Mutex::new(Rate { rate: cfg.put_rate, window: cfg.put_window, times: VecDeque::new() }),
@@ -331,7 +424,7 @@ impl Records {
         }
         let rec = self.node.publish_ttl(&topic, data, ttl.min(MAX_TTL)).await.map_err(RecordError::Net)?;
         if let Some(e) = admit(&self.cfg.namespace, &rec, self.cfg.max_record_bytes, now_secs()) {
-            self.cache.lock().unwrap().insert(&rec, &e, true);
+            self.cache.lock().unwrap().insert(&rec, &e);
         }
         Ok(())
     }
@@ -343,7 +436,7 @@ impl Records {
         let found = self.node.find_within(&topic, self.cfg.query_deadline).await.map_err(RecordError::Net)?;
         let mut best: HashMap<PeerId, Entry> = HashMap::new();
         let mut keep = |e: Entry| {
-            if best.get(&e.publisher).is_none_or(|old| old.expires < e.expires) {
+            if best.get(&e.publisher).is_none_or(|old| old.issued < e.issued) {
                 best.insert(e.publisher, e);
             }
         };
@@ -362,7 +455,7 @@ impl Records {
         let mut cache = self.cache.lock().unwrap();
         for (rec, e) in net {
             if out.contains(&e) {
-                cache.insert(&rec, &e, false);
+                cache.insert(&rec, &e);
             }
         }
         Ok(out)
@@ -396,7 +489,7 @@ impl Records {
                     continue;
                 }
                 if let Some(e) = admit(&ns, &rec, max, now_secs()) {
-                    cache.lock().unwrap().insert(&rec, &e, false);
+                    cache.lock().unwrap().insert(&rec, &e);
                     b.lock().unwrap().push(e);
                     n.notify_one();
                 }
@@ -544,10 +637,14 @@ mod tests {
 
     #[test]
     fn caps_on_query_subscription_and_rate() {
-        let e = |n: u8, exp: u64| Entry { kind: "k".into(), key: "x".into(), publisher: PeerId::random(), data: vec![n; 10], expires: exp };
+        let e = |n: u8, iss: u64| Entry { kind: "k".into(), key: "x".into(), publisher: PeerId::random(), data: vec![n; 10], issued: iss, expires: 99 };
         let v = vec![e(1, 10), e(2, 30), e(3, 20)];
         let out = cap(v.clone(), 2, 1000);
-        assert_eq!(out.iter().map(|e| e.expires).collect::<Vec<_>>(), [30, 20]);
+        assert_eq!(out.iter().map(|e| e.issued).collect::<Vec<_>>(), [30, 20]);
+        // A future issue time does not outrank a record issued now.
+        let now = cosmos_net::now_ms();
+        let out = cap(vec![e(1, now + 100_000), e(2, now)], 2, 1000);
+        assert_eq!(out.len(), 2);
         assert_eq!(cap(v, 10, 25).len(), 2);
 
         let mut b = Buf { q: VecDeque::new(), bytes: 0, max_records: 3, max_bytes: 25, closed: false };
@@ -565,39 +662,48 @@ mod tests {
         assert!(r.allow(t + Duration::from_secs(10)));
     }
 
+    fn put_in(c: &mut Cache, k: &Keypair, kind: &str, key: &str, ttl: u64) -> Record {
+        let r = signed(k, "game", kind, key, key.as_bytes(), ttl);
+        let e = admit("game", &r, 64, now_secs()).unwrap();
+        c.insert(&r, &e);
+        r
+    }
+
     #[test]
     fn disk_cache_reloads_bounded_and_ignores_corrupt_files() {
         let dir = Dir::new("cache");
+        let ours = dir.0.join("game");
         let k = Keypair::generate_ed25519();
-        let mut c = Cache::open("game", 64, 3, Some(dir.0.clone()));
-        let put = |c: &mut Cache, key: &str, ttl: u64| {
-            let r = signed(&k, "game", "note", key, key.as_bytes(), ttl);
-            let e = admit("game", &r, 64, now_secs()).unwrap();
-            c.insert(&r, &e, false);
-        };
+        let me = PeerId::random();
+        let mut c = Cache::open("game", me, 64, 3, Some(dir.0.clone()));
         for (i, key) in ["a", "b", "c", "d"].iter().enumerate() {
-            put(&mut c, key, 100 + i as u64 * 10);
+            put_in(&mut c, &k, "note", key, 100 + i as u64 * 10);
         }
-        assert!(c.get(&topic("game", "note", "a").unwrap(), now_secs()).is_empty(), "shortest-lived not evicted");
-        let files = || std::fs::read_dir(&dir.0).unwrap().count();
-        assert_eq!(files(), 3, "evicted file left on disk");
+        assert!(c.get(&topic("game", "note", "a").unwrap(), now_secs()).is_empty(), "oldest not evicted");
+        c.flush();
+        let files = |d: &PathBuf| std::fs::read_dir(d).unwrap().count();
+        assert_eq!(files(&ours), 3, "evicted file left on disk");
 
-        // Corrupt, truncated, tampered and misnamed files, plus another game's record.
-        let real = std::fs::read_dir(&dir.0).unwrap().next().unwrap().unwrap().path();
+        // Corrupt, truncated, tampered and misnamed files in our folder;
+        // unrelated files next to it and in it must survive.
+        let real = std::fs::read_dir(&ours).unwrap().next().unwrap().unwrap().path();
         let bytes = std::fs::read(&real).unwrap();
         let mut tampered = bytes.clone();
         let n = tampered.len();
         tampered[n - 70] ^= 1;
-        std::fs::write(dir.0.join("garbage.rec"), b"junk").unwrap();
-        std::fs::write(dir.0.join("trunc.rec"), &bytes[..bytes.len() / 2]).unwrap();
-        std::fs::write(dir.0.join("tampered.rec"), &tampered).unwrap();
-        std::fs::write(dir.0.join("copy.rec"), &bytes).unwrap();
+        let fake = |c: char| format!("{}.rec", c.to_string().repeat(32));
+        std::fs::write(ours.join(fake('0')), b"junk").unwrap();
+        std::fs::write(ours.join(fake('1')), &bytes[..bytes.len() / 2]).unwrap();
+        std::fs::write(ours.join(fake('2')), &tampered).unwrap();
+        std::fs::write(ours.join(fake('3')), &bytes).unwrap();
+        std::fs::write(ours.join(fake('4')), vec![0u8; 64 + OVERHEAD + 1]).unwrap();
         let other = signed(&k, "other", "note", "b", b"b", 100);
-        let other_name = file_name(&other.topic, &other.publisher);
-        std::fs::write(dir.0.join(&other_name), &other.signed).unwrap();
-        std::fs::write(dir.0.join("big.rec"), vec![0u8; 64 + OVERHEAD + 1]).unwrap();
+        std::fs::write(ours.join(file_name(&other.topic, &other.publisher)), &other.signed).unwrap();
+        std::fs::write(ours.join("notes.txt"), b"user file").unwrap();
+        std::fs::write(dir.0.join("someone-else.rec"), b"not ours").unwrap();
+        drop(c);
 
-        let c2 = Cache::open("game", 64, 3, Some(dir.0.clone()));
+        let c2 = Cache::open("game", me, 64, 3, Some(dir.0.clone()));
         assert_eq!(c2.map.len(), 3);
         for key in ["b", "c", "d"] {
             let got = c2.get(&topic("game", "note", key).unwrap(), now_secs());
@@ -605,7 +711,58 @@ mod tests {
             assert_eq!(got[0].data, key.as_bytes());
         }
         assert!(c2.get(&other.topic, now_secs()).is_empty(), "other game's record surfaced");
-        assert!(Cache::open("other", 64, 3, Some(dir.0.clone())).get(&other.topic, now_secs()).len() == 1);
-        assert_eq!(files(), 4, "bad files not cleaned up: 3 records + other game's");
+        assert_eq!(files(&ours), 4, "bad files not cleaned up: 3 records + notes.txt");
+        assert!(dir.0.join("someone-else.rec").exists(), "deleted a file outside our folder");
+    }
+
+    #[test]
+    fn load_evicts_extra_files_and_is_not_starved_by_junk() {
+        let dir = Dir::new("load");
+        let k = Keypair::generate_ed25519();
+        let me = PeerId::random();
+        let ours = dir.0.join("game");
+        std::fs::create_dir_all(&ours).unwrap();
+        for i in 0..40 {
+            std::fs::write(ours.join(format!("junk{i:02}.bin")), b"x").unwrap();
+        }
+        // More valid records on disk than the cache holds.
+        for key in ["a", "b", "c", "d", "e"] {
+            let r = signed(&k, "game", "note", key, key.as_bytes(), 100);
+            std::fs::write(ours.join(file_name(&r.topic, &r.publisher)), &r.signed).unwrap();
+        }
+        let c = Cache::open("game", me, 64, 3, Some(dir.0.clone()));
+        assert_eq!(c.map.len(), 3, "records not loaded past junk");
+        let recs = std::fs::read_dir(&ours).unwrap().flatten().filter(|e| e.file_name().to_str().is_some_and(is_cache_name)).count();
+        assert_eq!(recs, 3, "files evicted during load left on disk");
+    }
+
+    #[test]
+    fn flood_on_one_topic_spares_other_topics_and_our_own() {
+        let me = Keypair::generate_ed25519();
+        let mut c = Cache::open("game", me.public().to_peer_id(), 64, 8, None);
+        put_in(&mut c, &me, "note", "mine", 60);
+        let honest = Keypair::generate_ed25519();
+        put_in(&mut c, &honest, "note", "lobby", 60);
+        // Sybils with the longest TTL and freshest issue flood one key.
+        for _ in 0..50 {
+            put_in(&mut c, &Keypair::generate_ed25519(), "note", "spam", 1800);
+        }
+        let now = now_secs();
+        assert_eq!(c.map.len(), 8);
+        assert_eq!(c.get(&topic("game", "note", "mine").unwrap(), now).len(), 1, "own record evicted");
+        assert_eq!(c.get(&topic("game", "note", "lobby").unwrap(), now).len(), 1, "other topic evicted by flood");
+    }
+
+    #[test]
+    fn newer_issue_replaces_longer_lived_record() {
+        let k = Keypair::generate_ed25519();
+        let mut c = Cache::open("game", PeerId::random(), 64, 8, None);
+        let t = topic("game", "note", "x").unwrap();
+        let old = signed(&k, "game", "note", "x", b"v1", 1800);
+        let new = signed(&k, "game", "note", "x", b"v2", 60);
+        c.insert(&new, &admit("game", &new, 64, now_secs()).unwrap());
+        // A replay of the older, longer-lived record loses.
+        c.insert(&old, &admit("game", &old, 64, now_secs()).unwrap());
+        assert_eq!(c.get(&t, now_secs())[0].data, b"v2");
     }
 }

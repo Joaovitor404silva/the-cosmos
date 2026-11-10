@@ -12,7 +12,7 @@ pub use discovery::{ConnLimits, ipfs_bootstrap, parse_list, provider_key};
 pub use libp2p::{Multiaddr, PeerId, Stream as P2pStream, identity::Keypair};
 pub use portguess::Plan as PortGuessPlan;
 pub use punch::{ADDR_TOPIC, ConnectError, decode_addrs, encode_addrs, verify_addr_record};
-pub use record::{CLOCK_SKEW, MAX_TTL, Record, now_secs};
+pub use record::{CLOCK_SKEW, MAX_TTL, Record, now_ms, now_secs};
 pub use rpc::{RpcLimits, RpcRequest, RpcStats};
 
 use anyhow::anyhow;
@@ -261,6 +261,12 @@ enum Command {
     },
     Subscribe {
         topic: String,
+    },
+    Unsubscribe {
+        topic: String,
+    },
+    Topics {
+        reply: oneshot::Sender<Vec<String>>,
     },
     Connect {
         peer: PeerId,
@@ -686,6 +692,23 @@ pub fn is_public_addr(addr: &Multiaddr) -> bool {
 
 type PeerSet = Arc<Mutex<HashSet<PeerId>>>;
 type Topics = Arc<Mutex<HashMap<String, broadcast::Sender<Record>>>>;
+
+/// Leaves the gossip topic when the last subscriber stream is dropped.
+struct TopicGuard {
+    topic: String,
+    topics: Topics,
+    cmd: mpsc::UnboundedSender<Command>,
+}
+
+impl Drop for TopicGuard {
+    fn drop(&mut self) {
+        let mut t = self.topics.lock().unwrap();
+        if t.get(&self.topic).is_some_and(|tx| tx.receiver_count() == 0) {
+            t.remove(&self.topic);
+            let _ = self.cmd.send(Command::Unsubscribe { topic: std::mem::take(&mut self.topic) });
+        }
+    }
+}
 type Own = Arc<Mutex<HashMap<String, Vec<u8>>>>;
 
 fn build_swarm(cfg: &Config, keypair: Keypair, blocked: PeerSet) -> anyhow::Result<Swarm<Behaviour>> {
@@ -1155,28 +1178,41 @@ impl Node {
             .ok_or_else(|| anyhow!("peer served no valid record"))
     }
 
+    /// Gossip records on `topic`. The node leaves the gossip topic when the
+    /// last stream for it is dropped.
     pub fn subscribe(&self, topic: &str) -> impl Stream<Item = Record> + Send + 'static {
-        let _ = self.cmd.send(Command::Subscribe {
-            topic: topic.to_string(),
-        });
         let topic = topic.to_string();
         let rx = {
+            // Subscribe and Unsubscribe are sent under this lock, so the
+            // node sees them in the same order as the map changes.
             let mut t = self.topics.lock().unwrap();
             t.retain(|_, tx| tx.receiver_count() > 0);
+            let _ = self.cmd.send(Command::Subscribe { topic: topic.clone() });
             t.entry(topic.clone())
                 .or_insert_with(|| broadcast::channel(256).0)
                 .subscribe()
         };
-        futures::stream::unfold(rx, |mut rx| async move {
+        let guard = TopicGuard {
+            topic: topic.clone(),
+            topics: self.topics.clone(),
+            cmd: self.cmd.clone(),
+        };
+        // `rx` drops before `guard` (tuple field order).
+        futures::stream::unfold((rx, guard), |(mut rx, guard)| async move {
             loop {
                 match rx.recv().await {
-                    Ok(r) => return Some((r, rx)),
+                    Ok(r) => return Some((r, (rx, guard))),
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => return None,
                 }
             }
         })
         .filter(move |r| futures::future::ready(r.topic == topic))
+    }
+
+    /// Gossip topics this node is subscribed to (diagnostics, tests).
+    pub async fn gossip_topics(&self) -> Vec<String> {
+        self.ask(|reply| Command::Topics { reply }).await
     }
 
     pub fn events(&self) -> impl Stream<Item = Event> + Send + 'static {
@@ -1528,7 +1564,8 @@ struct EventLoop {
     own: Own,
     rec_slots: Arc<tokio::sync::Semaphore>,
     rec_peer_slots: HashMap<PeerId, Arc<tokio::sync::Semaphore>>,
-    gossip_seen: HashMap<(String, PeerId), u64>,
+    /// (topic, publisher) -> (issued ms, expires s) of the newest gossip seen.
+    gossip_seen: HashMap<(String, PeerId), (u64, u64)>,
     gossip_rate: HashMap<(PeerId, String), (Instant, u16)>,
     purged: Instant,
     pending: HashMap<kad::QueryId, Pending>,
@@ -1760,6 +1797,16 @@ impl EventLoop {
                     .behaviour_mut()
                     .gossipsub
                     .subscribe(&gossipsub::IdentTopic::new(topic));
+            }
+            Command::Unsubscribe { topic } => {
+                self.swarm
+                    .behaviour_mut()
+                    .gossipsub
+                    .unsubscribe(&gossipsub::IdentTopic::new(topic));
+            }
+            Command::Topics { reply } => {
+                let t = self.swarm.behaviour().gossipsub.topics().map(|h| h.to_string()).collect();
+                let _ = reply.send(t);
             }
             Command::Connect { peer, reply } => self.connect_peer(peer, Some(reply)),
             Command::Dial { addr, reply } => {
@@ -2928,7 +2975,7 @@ impl EventLoop {
             .purge(std::time::Instant::now());
         let t = record::now_secs();
         self.gossip_seen
-            .retain(|_, e| e.saturating_add(CLOCK_SKEW.as_secs()) > t);
+            .retain(|_, (_, e)| e.saturating_add(CLOCK_SKEW.as_secs()) > t);
         self.in_flight.retain(|_, s| !s.is_empty());
         if self.seeds.len() >= SEEDS_MAX / 2 {
             self.prune_seeds();
@@ -2938,19 +2985,19 @@ impl EventLoop {
     fn gossip_fresh(&mut self, rec: &Record) -> bool {
         let k = (rec.topic.clone(), rec.publisher);
         match self.gossip_seen.get_mut(&k) {
-            Some(e) if *e >= rec.expires => false,
-            Some(e) => {
-                *e = rec.expires;
+            Some((i, _)) if *i >= rec.issued => false,
+            Some(v) => {
+                *v = (rec.issued, rec.expires);
                 true
             }
             None => {
                 if self.gossip_seen.len() >= GOSSIP_SEEN_MAX {
                     let t = record::now_secs();
                     self.gossip_seen
-                        .retain(|_, e| e.saturating_add(CLOCK_SKEW.as_secs()) > t);
+                        .retain(|_, (_, e)| e.saturating_add(CLOCK_SKEW.as_secs()) > t);
                 }
                 if self.gossip_seen.len() < GOSSIP_SEEN_MAX {
-                    self.gossip_seen.insert(k, rec.expires);
+                    self.gossip_seen.insert(k, (rec.issued, rec.expires));
                 }
                 true
             }
@@ -3130,7 +3177,7 @@ impl EventLoop {
                 let newer = store
                     .get(&r.key)
                     .and_then(|old| Record::verify(&old.value))
-                    .is_some_and(|old| old.expires > rec.expires);
+                    .is_some_and(|old| old.issued > rec.issued);
                 if newer {
                     tracing::debug!(%source, "dropping kad record older than the stored one");
                     return;
