@@ -212,20 +212,22 @@ struct Cache {
     max_bytes: usize,
     max_records: usize,
     disk: Option<SyncSender<DiskOp>>,
+    writer: Option<std::thread::JoinHandle<()>>,
     map: HashMap<(String, PeerId), (Entry, Vec<u8>)>,
 }
 
 impl Cache {
     fn open(ns: &str, me: PeerId, max_bytes: usize, max_records: usize, dir: Option<PathBuf>) -> Cache {
-        let mut c = Cache { ns: ns.to_string(), me, max_bytes, max_records, disk: None, map: HashMap::new() };
+        let mut c = Cache { ns: ns.to_string(), me, max_bytes, max_records, disk: None, writer: None, map: HashMap::new() };
         if let Some(dir) = dir.map(|d| d.join(ns))
             && std::fs::create_dir_all(&dir).is_ok()
         {
             c.load(&dir, now_secs());
             let (tx, rx) = sync_channel(4096);
             let d = dir.clone();
-            if std::thread::Builder::new().name("cosmos-rec-disk".into()).spawn(move || disk_writer(d, rx)).is_ok() {
+            if let Ok(w) = std::thread::Builder::new().name("cosmos-rec-disk".into()).spawn(move || disk_writer(d, rx)) {
                 c.disk = Some(tx);
+                c.writer = Some(w);
             }
         }
         c
@@ -348,6 +350,16 @@ impl Cache {
             .filter(|((t, _), (e, _))| t == topic && e.expires > now)
             .map(|(_, (e, _))| e.clone())
             .collect()
+    }
+}
+
+impl Drop for Cache {
+    /// Finish queued disk writes, so a reopened cache sees them.
+    fn drop(&mut self) {
+        self.disk = None;
+        if let Some(w) = self.writer.take() {
+            let _ = w.join();
+        }
     }
 }
 

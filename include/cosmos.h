@@ -356,6 +356,12 @@ int32_t cosmos_send(cosmos_t *c,
 int32_t cosmos_poll(cosmos_t *c, cosmos_event_t *ev);
 
 /**
+ * Handle of the session host, 0 when we are the host or have no session.
+ * Only trust session control messages (level, state) from this peer.
+ */
+uint32_t cosmos_host_peer(const cosmos_t *c);
+
+/**
  * Events dropped because the queue was full (oldest go first).
  */
 uint64_t cosmos_dropped_events(const cosmos_t *c);
