@@ -3,10 +3,12 @@
 //! No relay is involved. Each node keeps a signed record of the addresses it
 //! can be reached on (observed, UPnP, public and LAN listeners) in the DHT
 //! under `record_key(ADDR_TOPIC, peer_id)`. To reach a peer, a node fetches
-//! that record, publishes a signed punch request under `punch_topic(target)`
-//! carrying its own addresses and a dial-at time, and dials the target
-//! repeatedly. The target polls its punch topic and dials back at the same
-//! time, so both NATs open a mapping toward each other.
+//! that record, puts a short-lived signed punch request into one of the
+//! target's `INBOX_SLOTS` inbox keys (a plain DHT record, no provider entry,
+//! no gossip) carrying its own addresses, and dials the target repeatedly.
+//! The target polls its inbox slots and dials back as soon as it sees a
+//! request, so both NATs open a mapping toward each other. Freshness comes
+//! from the signed record expiry plus a nonce, not from wall-clock dial times.
 //!
 //! If the request also carries a port-guess offer, the target answers with
 //! its own offer under `guess_topic(requester)` and both sides run the
@@ -21,9 +23,28 @@ pub const ADDR_TOPIC: &str = "cosmos/addr";
 pub const MAX_ADDRS: usize = 16;
 const MAX_ADDR_LEN: usize = 256;
 const VERSION: u8 = 1;
+const REQ_VERSION: u8 = 2;
 
-pub fn punch_topic(target: &PeerId) -> String {
-    format!("cosmos/punch/{target}")
+/// Inbox slots per target. Sessions hold at most 4 players, so at most 3
+/// requesters punch one host at a time; requesters re-put into a random slot
+/// every poll, so a collision only delays them by one poll.
+pub const INBOX_SLOTS: u8 = 4;
+/// Longest lifetime a punch inbox record may claim.
+pub const INBOX_MAX_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+const INBOX_PREFIX: &str = "cosmos/punch/";
+
+pub fn inbox_topic(target: &PeerId, slot: u8) -> String {
+    format!("{INBOX_PREFIX}{target}/{slot}")
+}
+
+/// `(target, slot)` of a punch inbox topic.
+pub fn parse_inbox_topic(topic: &str) -> Option<(PeerId, u8)> {
+    let (target, slot) = topic.strip_prefix(INBOX_PREFIX)?.rsplit_once('/')?;
+    let n: u8 = slot.parse().ok()?;
+    if n >= INBOX_SLOTS || n.to_string() != slot {
+        return None;
+    }
+    Some((target.parse().ok()?, n))
 }
 
 pub fn guess_topic(requester: &PeerId) -> String {
@@ -110,7 +131,6 @@ pub fn addrs_of(rec: &Record, peer: &PeerId) -> Option<Vec<Multiaddr>> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Request {
-    pub dial_at_ms: u64,
     pub nonce: [u8; 16],
     pub addrs: Vec<Multiaddr>,
     pub guess: Option<(Ipv4Addr, [u8; 16])>,
@@ -118,8 +138,7 @@ pub struct Request {
 
 impl Request {
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = vec![VERSION];
-        out.extend_from_slice(&self.dial_at_ms.to_be_bytes());
+        let mut out = vec![REQ_VERSION];
         out.extend_from_slice(&self.nonce);
         put_addrs(&mut out, &self.addrs);
         if let Some((ip, nonce)) = self.guess {
@@ -131,12 +150,11 @@ impl Request {
 
     pub fn decode(b: &[u8]) -> Option<Request> {
         let (&v, rest) = b.split_first()?;
-        if v != VERSION || rest.len() < 8 + 16 {
+        if v != REQ_VERSION || rest.len() < 16 {
             return None;
         }
-        let dial_at_ms = u64::from_be_bytes(rest[..8].try_into().ok()?);
-        let nonce: [u8; 16] = rest[8..24].try_into().ok()?;
-        let (addrs, rest) = take_addrs(&rest[24..])?;
+        let nonce: [u8; 16] = rest[..16].try_into().ok()?;
+        let (addrs, rest) = take_addrs(&rest[16..])?;
         let guess = match rest.len() {
             0 => None,
             20 => {
@@ -146,7 +164,6 @@ impl Request {
             _ => return None,
         };
         Some(Request {
-            dial_at_ms,
             nonce,
             addrs,
             guess,
@@ -162,15 +179,47 @@ pub fn guess_answer_of(rec: &Record, requester: &PeerId, target: &PeerId) -> Opt
     Offer::decode(&rec.data)
 }
 
-pub fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+/// A punch request read from our inbox: valid only if it is a signed record
+/// for `inbox_topic(me, slot)`, short-lived, and not from ourselves.
+pub fn inbox_request(rec: &Record, me: &PeerId, slot: u8) -> Option<Request> {
+    let max_expiry = crate::record::now_secs() + INBOX_MAX_TTL.as_secs() + crate::CLOCK_SKEW.as_secs();
+    if rec.topic != inbox_topic(me, slot) || rec.publisher == *me || rec.expires > max_expiry {
+        return None;
+    }
+    Request::decode(&rec.data)
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn inbox_topics_roundtrip_and_reject_junk() {
+        let t = PeerId::random();
+        for slot in 0..INBOX_SLOTS {
+            assert_eq!(parse_inbox_topic(&inbox_topic(&t, slot)), Some((t, slot)));
+        }
+        assert_eq!(parse_inbox_topic(&format!("cosmos/punch/{t}/{INBOX_SLOTS}")), None);
+        assert_eq!(parse_inbox_topic(&format!("cosmos/punch/{t}/01")), None);
+        assert_eq!(parse_inbox_topic(&format!("cosmos/punch/{t}")), None);
+        assert_eq!(parse_inbox_topic("cosmos/punch/nope/0"), None);
+        assert_eq!(parse_inbox_topic(&format!("cosmos/addr/{t}/0")), None);
+    }
+
+    #[test]
+    fn inbox_request_checks_target_slot_publisher_and_ttl() {
+        let me_k = Keypair::generate_ed25519();
+        let me = me_k.public().to_peer_id();
+        let other = Keypair::generate_ed25519();
+        let req = Request { nonce: [1; 16], addrs: vec![ma("/ip4/1.2.3.4/udp/5/quic-v1")], guess: None };
+        let sign = |k: &Keypair, topic: &str, ttl: u64| {
+            Record::verify(&Record::sign(k, topic, req.encode(), Duration::from_secs(ttl)).unwrap()).unwrap()
+        };
+        assert_eq!(inbox_request(&sign(&other, &inbox_topic(&me, 2), 30), &me, 2), Some(req.clone()));
+        assert_eq!(inbox_request(&sign(&other, &inbox_topic(&me, 2), 30), &me, 1), None);
+        assert_eq!(inbox_request(&sign(&other, &inbox_topic(&PeerId::random(), 2), 30), &me, 2), None);
+        assert_eq!(inbox_request(&sign(&me_k, &inbox_topic(&me, 2), 30), &me, 2), None);
+        assert_eq!(inbox_request(&sign(&other, &inbox_topic(&me, 2), 900), &me, 2), None);
+    }
+
     use super::*;
     use libp2p::identity::Keypair;
     use std::time::Duration;
@@ -214,7 +263,6 @@ mod tests {
     #[test]
     fn request_roundtrip_and_rejects_junk() {
         let r = Request {
-            dial_at_ms: 1_700_000_000_123,
             nonce: [7; 16],
             addrs: vec![ma("/ip4/1.2.3.4/udp/5/quic-v1")],
             guess: Some((Ipv4Addr::new(1, 2, 3, 4), [9; 16])),
@@ -226,6 +274,9 @@ mod tests {
         long.push(0);
         assert_eq!(Request::decode(&long), None);
         assert_eq!(Request::decode(&plain.encode()[..10]), None);
+        let mut v1 = plain.encode();
+        v1[0] = VERSION;
+        assert_eq!(Request::decode(&v1), None);
         let mut many = vec![VERSION];
         many.push(200);
         assert_eq!(decode_addrs(&many), None);
