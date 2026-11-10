@@ -94,6 +94,8 @@ pub const COSMOS_CODE_MAX: usize = 12;
 pub const COSMOS_PEER_ID_MAX: usize = 64;
 
 const DEFAULT_QUEUE: usize = 1024;
+/// Largest `event_queue` honoured.
+const QUEUE_MAX: usize = 65536;
 const JOIN_TIMEOUT: Duration = Duration::from_secs(30);
 const STEAM_REPUBLISH: Duration = Duration::from_secs(240);
 
@@ -379,6 +381,11 @@ enum Ev {
 }
 
 impl Ev {
+    /// Data events a full queue may drop.
+    fn droppable(&self) -> bool {
+        matches!(self, Ev::Message { .. } | Ev::RecordUpdate { .. })
+    }
+
     /// Point `out` into `self`; valid while `self` lives.
     fn fill(&self, out: &mut CosmosEvent) {
         *out = CosmosEvent::default();
@@ -450,10 +457,24 @@ struct Shared {
 }
 
 impl Shared {
+    /// Queue `e`. When full, the oldest message / record update goes first;
+    /// control events (joins, leaves, end, path, errors, query results) are
+    /// kept unless they alone fill twice the cap.
     fn push(&self, e: Ev) {
         let mut q = lock(&self.queue);
         if q.q.len() >= q.cap {
-            q.q.pop_front();
+            match q.q.iter().position(Ev::droppable) {
+                Some(i) => drop(q.q.remove(i)),
+                None if e.droppable() => {
+                    q.dropped += 1;
+                    return;
+                }
+                None if q.q.len() >= q.cap.saturating_mul(2) => drop(q.q.pop_front()),
+                None => {
+                    q.q.push_back(e);
+                    return;
+                }
+            }
             q.dropped += 1;
         }
         q.q.push_back(e);
@@ -507,6 +528,8 @@ struct State {
     transport: Mutex<Option<Arc<dyn Transport>>>,
     session: Mutex<Option<Arc<Session>>>,
     advert: Mutex<Option<Advertisement>>,
+    /// A host/join is in progress or done (only one per handle).
+    starting: std::sync::atomic::AtomicBool,
     /// The event last handed out by `cosmos_poll`.
     current: Mutex<Option<Ev>>,
     subs: Mutex<HashMap<u32, JoinHandle<()>>>,
@@ -614,10 +637,19 @@ unsafe fn init(cfg: *const CosmosConfig) -> Result<Box<Cosmos>, Fail> {
             steam = Some(api);
         }
     }
-    let transport: Arc<dyn Transport> =
-        PathSet::new(paths, PathConfig::default()).map_err(|e| fail(COSMOS_E_NET, e))?;
-    let records = Arc::new(Records::new(node.clone(), rcfg).map_err(record_err)?);
-    let cap = if cfg.event_queue == 0 { DEFAULT_QUEUE } else { cfg.event_queue as usize };
+    let built = PathSet::new(paths, PathConfig::default())
+        .map_err(|e| fail(COSMOS_E_NET, e))
+        .and_then(|t| Ok((t, Arc::new(Records::new(node.clone(), rcfg).map_err(record_err)?))));
+    let (transport, records): (Arc<dyn Transport>, _) = match built {
+        Ok((t, r)) => (t as Arc<dyn Transport>, r),
+        Err(e) => {
+            if let Some(api) = &steam {
+                api.release();
+            }
+            return Err(e);
+        }
+    };
+    let cap = if cfg.event_queue == 0 { DEFAULT_QUEUE } else { (cfg.event_queue as usize).min(QUEUE_MAX) };
     let st = State {
         ns,
         node,
@@ -629,6 +661,7 @@ unsafe fn init(cfg: *const CosmosConfig) -> Result<Box<Cosmos>, Fail> {
         transport: Mutex::new(Some(transport)),
         session: Mutex::new(None),
         advert: Mutex::new(None),
+        starting: std::sync::atomic::AtomicBool::new(false),
         current: Mutex::new(None),
         subs: Mutex::new(HashMap::new()),
         next_sub: AtomicU32::new(1),
@@ -665,10 +698,25 @@ impl Cosmos {
         *lock(&self.st.session) = Some(Arc::new(s));
     }
 
-    fn host(&self) -> Result<String, Fail> {
-        if lock(&self.st.transport).is_none() {
+    /// Claim the handle's one host/join, or `E_STATE`.
+    fn begin(&self) -> Result<(), Fail> {
+        if self.st.starting.swap(true, Ordering::AcqRel) || lock(&self.st.transport).is_none() {
             return Err(fail(COSMOS_E_STATE, "this handle already started a session; create a new one"));
         }
+        Ok(())
+    }
+
+    fn host(&self) -> Result<String, Fail> {
+        self.begin()?;
+        let r = self.host_inner();
+        if r.is_err() && lock(&self.st.transport).is_some() {
+            // Failed before the session took the transport: may retry.
+            self.st.starting.store(false, Ordering::Release);
+        }
+        r
+    }
+
+    fn host_inner(&self) -> Result<String, Fail> {
         let t = lock(&self.st.transport).clone().unwrap();
         let st = &self.st;
         let adv = self.rt.block_on(async {
@@ -687,9 +735,15 @@ impl Cosmos {
 
     fn join(&self, code: &str) -> Result<(), Fail> {
         let code = code::normalize(code).ok_or_else(|| fail(COSMOS_E_INVALID, "malformed join code"))?;
-        if lock(&self.st.transport).is_none() {
-            return Err(fail(COSMOS_E_STATE, "this handle already started a session; create a new one"));
+        self.begin()?;
+        let r = self.join_inner(code);
+        if r.is_err() && lock(&self.st.transport).is_some() {
+            self.st.starting.store(false, Ordering::Release);
         }
+        r
+    }
+
+    fn join_inner(&self, code: String) -> Result<(), Fail> {
         let st = &self.st;
         let start = Instant::now();
         let advert = self.rt.block_on(async {
@@ -788,12 +842,19 @@ impl Cosmos {
 
     fn close(self) {
         let Cosmos { st, rt } = self;
+        // Called from inside some other tokio runtime: we can neither
+        // block_on nor drop a runtime there.
+        let nested = tokio::runtime::Handle::try_current().is_ok();
         {
             let _g = rt.enter();
             if let Some(s) = lock(&st.session).take() {
                 s.leave();
-                // Let the goodbye frames go out before the runtime stops.
-                rt.block_on(tokio::time::sleep(Duration::from_millis(200)));
+                if nested {
+                    std::thread::sleep(Duration::from_millis(200));
+                } else {
+                    // Let the goodbye frames go out before the runtime stops.
+                    rt.block_on(tokio::time::sleep(Duration::from_millis(200)));
+                }
             }
             for (_, t) in lock(&st.subs).drain() {
                 t.abort();
@@ -802,11 +863,15 @@ impl Cosmos {
                 t.abort();
             }
             if let Some(api) = &st.steam {
-                api.shutdown();
+                api.release();
             }
             drop(st);
         }
-        rt.shutdown_timeout(Duration::from_secs(2));
+        if nested {
+            rt.shutdown_background();
+        } else {
+            rt.shutdown_timeout(Duration::from_secs(2));
+        }
     }
 }
 

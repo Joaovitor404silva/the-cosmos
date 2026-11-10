@@ -313,18 +313,39 @@ unsafe fn load_abs(path: &std::path::Path) -> Result<Library, libloading::Error>
     unsafe { Library::new(path) }
 }
 
+/// The loaded API and how many `load`s hold it.
+static API: Mutex<Option<(Arc<SteamApi>, usize)>> = Mutex::new(None);
+
 impl SteamApi {
     /// The process-wide Steam API, loading and initializing it on first use.
-    /// Later calls return the same instance and ignore `cfg`.
+    /// Later calls return the same instance and ignore `cfg`. Each `load`
+    /// takes a reference; give it back with `release`.
     pub fn load(cfg: &SteamConfig) -> Result<Arc<SteamApi>, Unavailable> {
-        static API: Mutex<Option<Arc<SteamApi>>> = Mutex::new(None);
         let mut g = API.lock().unwrap();
-        if let Some(a) = &*g {
+        if let Some((a, n)) = &mut *g {
+            *n += 1;
             return Ok(a.clone());
         }
         let a = Arc::new(Self::open(cfg)?);
-        *g = Some(a.clone());
+        *g = Some((a.clone(), 1));
         Ok(a)
+    }
+
+    /// Give back one `load`. The last one shuts Steam down (if we
+    /// initialized it); a later `load` opens it again.
+    pub fn release(self: &Arc<Self>) {
+        let mut g = API.lock().unwrap();
+        let last = match &mut *g {
+            Some((a, n)) if Arc::ptr_eq(a, self) => {
+                *n -= 1;
+                *n == 0
+            }
+            _ => return,
+        };
+        if last {
+            *g = None;
+            self.shutdown();
+        }
     }
 
     fn open(cfg: &SteamConfig) -> Result<SteamApi, Unavailable> {
@@ -602,7 +623,7 @@ impl SteamApi {
     }
 
     /// Shut Steam down if we initialized it (no-op when borrowed). Every
-    /// Steam path in the process goes dead; call at process exit.
+    /// Steam path in the process goes dead; prefer `release`.
     pub fn shutdown(&self) {
         let mut down = self.down.write().unwrap();
         if let (false, Some(f)) = (*down, self.shutdown) {

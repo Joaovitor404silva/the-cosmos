@@ -328,3 +328,42 @@ fn path_names_map_to_kinds() {
     assert_eq!(path_kind(cosmos_steam::PATH_NAME), COSMOS_PATH_RELAY);
     assert_eq!(path_kind("?"), COSMOS_PATH_UNKNOWN);
 }
+
+#[test]
+fn full_queue_never_drops_control_events() {
+    let c = cfg(None);
+    let mut c2 = c.cfg;
+    c2.event_queue = 4;
+    let h = unsafe { cosmos_init(&c2) };
+    assert!(!h.is_null());
+    let me = unsafe { &*h };
+    me.push(Ev::Joined(1));
+    for i in 0..10u8 {
+        me.push(Ev::Message { peer: 1, channel: i, reliable: false, data: vec![i] });
+    }
+    me.push(Ev::Left(1));
+    me.push(Ev::Ended);
+    let kinds: Vec<i32> = std::iter::from_fn(|| poll(h)).map(|g| g.kind).collect();
+    assert_eq!(kinds.first(), Some(&COSMOS_EV_PEER_JOINED), "{kinds:?}");
+    assert!(kinds.contains(&COSMOS_EV_PEER_LEFT) && kinds.contains(&COSMOS_EV_SESSION_ENDED), "{kinds:?}");
+    assert!(kinds.len() <= 4, "queue grew past its cap: {kinds:?}");
+    unsafe { cosmos_shutdown(h) };
+}
+
+#[test]
+fn event_queue_size_is_clamped() {
+    let c = cfg(None);
+    let mut c2 = c.cfg;
+    c2.event_queue = u32::MAX;
+    let h = unsafe { cosmos_init(&c2) };
+    assert!(!h.is_null());
+    assert_eq!(lock(&unsafe { &*h }.st.shared.queue).cap, QUEUE_MAX);
+    unsafe { cosmos_shutdown(h) };
+}
+
+#[test]
+fn shutdown_inside_a_tokio_runtime_does_not_abort() {
+    let h = init(None) as usize;
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+    rt.block_on(async move { unsafe { cosmos_shutdown(h as *mut Cosmos) } });
+}

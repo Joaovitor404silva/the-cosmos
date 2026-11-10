@@ -8,7 +8,9 @@
  * record_key, publisher) stay valid until the next cosmos_poll() or
  * cosmos_shutdown() on the same handle. Copy what you need to keep.
  *
- * Threads: every call is safe from any thread. cosmos_host() and
+ * Threads: every call is safe from any thread, except that cosmos_poll()
+ * and the event it fills belong to one thread at a time: a poll on another
+ * thread frees the previous event's pointers. cosmos_host() and
  * cosmos_join() block (DHT publish / lookup and handshake, up to ~30 s);
  * call them from a worker thread if the game must keep rendering.
  * cosmos_shutdown() frees the handle: no other call on it may run at the
