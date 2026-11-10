@@ -26,8 +26,8 @@ Spec: `docs/specs/2026-11-10-cosmos-sdk-design.md`. Workflow: unit TDD per task 
 - [ ] Live: two Steam accounts, two PCs (AppID 480), measure time-to-direct and fallback.
 
 ## M4 — Async plane
-- [ ] Record API: put/query/subscribe by `(game, kind, key)`, signed, TTL, size/rate caps, disk cache.
-- [ ] Tests: namespace isolation, tamper rejection, TTL expiry, cap enforcement.
+- [x] Record API: put/query/subscribe by `(game, kind, key)`, signed, TTL, size/rate caps, disk cache (`cosmos-core/src/records.rs`).
+- [x] Tests: namespace isolation, tamper rejection, TTL expiry, cap enforcement (`records.rs` unit tests, `tests/records.rs` on loopback nodes).
 
 ## M5 — C ABI
 - [ ] `cosmos-ffi` poll API per spec; cbindgen `cosmos.h`; C example (`examples/chat.c`) with 4 instances.

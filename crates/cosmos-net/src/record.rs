@@ -1,8 +1,9 @@
 use libp2p::PeerId;
 use libp2p::identity::{Keypair, PublicKey};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const DOMAIN: &[u8] = b"cosmos-record:v1";
+const DOMAIN: &[u8] = b"cosmos-record:v2";
 pub const MAX_TTL: Duration = Duration::from_secs(1800);
 pub const CLOCK_SKEW: Duration = Duration::from_secs(120);
 
@@ -11,7 +12,12 @@ pub struct Record {
     pub topic: String,
     pub data: Vec<u8>,
     pub publisher: PeerId,
+    /// Unix milliseconds when signed; the newer of two records from one
+    /// publisher on one topic has the larger `issued`.
+    pub issued: u64,
     pub expires: u64,
+    /// The exact signed bytes this record was verified from.
+    pub signed: Vec<u8>,
 }
 
 pub fn now_secs() -> u64 {
@@ -19,6 +25,22 @@ pub fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+pub fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Strictly increasing issue time in this process (two puts in one
+/// millisecond still order).
+fn next_issued() -> u64 {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = now_ms();
+    let prev = LAST.fetch_max(now, Ordering::AcqRel);
+    if prev < now { now } else { LAST.fetch_add(1, Ordering::AcqRel) + 1 }
 }
 
 fn put(buf: &mut Vec<u8>, bytes: &[u8]) {
@@ -45,14 +67,16 @@ impl<'a> Reader<'a> {
 
 impl Record {
     pub fn sign(keypair: &Keypair, topic: &str, data: Vec<u8>, ttl: Duration) -> anyhow::Result<Vec<u8>> {
-        Self::sign_expiring(keypair, topic, data, now_secs() + ttl.min(MAX_TTL).as_secs())
+        let issued = next_issued();
+        Self::sign_at(keypair, topic, data, issued, issued / 1000 + ttl.min(MAX_TTL).as_secs())
     }
 
-    fn sign_expiring(keypair: &Keypair, topic: &str, data: Vec<u8>, expires: u64) -> anyhow::Result<Vec<u8>> {
+    fn sign_at(keypair: &Keypair, topic: &str, data: Vec<u8>, issued: u64, expires: u64) -> anyhow::Result<Vec<u8>> {
         let mut buf = Vec::new();
         put(&mut buf, &keypair.public().encode_protobuf());
         put(&mut buf, topic.as_bytes());
         put(&mut buf, &data);
+        buf.extend_from_slice(&issued.to_be_bytes());
         buf.extend_from_slice(&expires.to_be_bytes());
         let mut msg = DOMAIN.to_vec();
         msg.extend_from_slice(&buf);
@@ -70,11 +94,22 @@ impl Record {
         let key = PublicKey::try_decode_protobuf(r.field()?).ok()?;
         let topic = String::from_utf8(r.field()?.to_vec()).ok()?;
         let data = r.field()?.to_vec();
+        let issued = u64::from_be_bytes(r.take(8)?.try_into().ok()?);
         let expires = u64::from_be_bytes(r.take(8)?.try_into().ok()?);
         let signed_len = bytes.len() - r.0.len();
         let sig = r.field()?;
         let skew = CLOCK_SKEW.as_secs();
-        if !r.0.is_empty() || expires.saturating_add(skew) <= now || expires > now + MAX_TTL.as_secs() + skew {
+        let max_ttl = MAX_TTL.as_secs();
+        // Issued no later than now (+skew), expiring after issue and within
+        // MAX_TTL of it.
+        let issued_s = issued / 1000;
+        if !r.0.is_empty()
+            || expires.saturating_add(skew) <= now
+            || expires > now + max_ttl + skew
+            || issued_s > now + skew
+            || expires <= issued_s
+            || expires > issued_s.saturating_add(max_ttl)
+        {
             return None;
         }
         let mut msg = DOMAIN.to_vec();
@@ -86,7 +121,9 @@ impl Record {
             topic,
             data,
             publisher: key.to_peer_id(),
+            issued,
             expires,
+            signed: bytes.to_vec(),
         })
     }
 }
@@ -111,7 +148,7 @@ mod tests {
     fn expiry_clamped_with_clock_skew() {
         let k = Keypair::generate_ed25519();
         let now = now_secs();
-        let at = |e: u64| Record::sign_expiring(&k, "game:kind", vec![1], e).unwrap();
+        let at = |e: u64| Record::sign_at(&k, "game:kind", vec![1], e.saturating_sub(MAX_TTL.as_secs()).saturating_mul(1000), e).unwrap();
         assert!(Record::verify_at(&at(now + 10 * 365 * 86400), now).is_none(), "far future accepted");
         assert!(Record::verify_at(&at(now + MAX_TTL.as_secs() + 300), now).is_none());
         assert!(Record::verify_at(&at(now + MAX_TTL.as_secs() + 60), now).is_some(), "skew ahead rejected");
@@ -120,5 +157,19 @@ mod tests {
         assert!(Record::verify_at(&at(u64::MAX), now).is_none());
         let long = Record::sign(&k, "game:kind", vec![1], Duration::from_secs(100 * 86400)).unwrap();
         assert!(Record::verify(&long).is_some(), "signer did not clamp ttl");
+    }
+
+    #[test]
+    fn issue_time_orders_and_is_bounded() {
+        let k = Keypair::generate_ed25519();
+        let a = Record::verify(&Record::sign(&k, "t", vec![1], Duration::from_secs(1800)).unwrap()).unwrap();
+        let b = Record::verify(&Record::sign(&k, "t", vec![2], Duration::from_secs(60)).unwrap()).unwrap();
+        assert!(b.issued > a.issued, "later sign must be newer even with a shorter ttl");
+        let now = now_secs();
+        let at = |i: u64, e: u64| Record::verify_at(&Record::sign_at(&k, "t", vec![1], i * 1000, e).unwrap(), now);
+        assert!(at(now + 600, now + 900).is_none(), "issued in the future");
+        assert!(at(now, now).is_none(), "expires at issue");
+        assert!(at(now - 10, now - 10 + MAX_TTL.as_secs() + 5).is_none(), "ttl over MAX_TTL from issue");
+        assert!(at(now - 10, now + 60).is_some());
     }
 }
