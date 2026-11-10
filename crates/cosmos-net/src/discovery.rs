@@ -312,20 +312,65 @@ fn conn_source(addr: &Multiaddr) -> ConnSource {
         .unwrap_or(ConnSource::Unknown)
 }
 
+/// (ip, port, udp) of a socket.
+type Hole = (IpAddr, u16, bool);
+
+/// How long a simulated NAT keeps a mapping open after an outbound packet.
+const HOLE_TTL: Duration = Duration::from_secs(10);
+const HOLES_MAX: usize = 4096;
+
+fn hole_of(a: &Multiaddr) -> Option<Hole> {
+    let ip = ip_of(a)?;
+    a.iter().find_map(|p| match p {
+        Protocol::Tcp(port) => Some((ip, port, false)),
+        Protocol::Udp(port) => Some((ip, port, true)),
+        _ => None,
+    })
+}
+
 pub struct IpLimit {
     max: usize,
     blocked: Arc<Mutex<HashSet<PeerId>>>,
     pending: HashMap<ConnectionId, ConnSource>,
     established: HashMap<ConnectionId, ConnSource>,
+    /// `Some` when simulating a NAT: sockets we dialed recently.
+    holes: Option<HashMap<Hole, Instant>>,
 }
 
 impl IpLimit {
-    pub fn new(max: usize, blocked: Arc<Mutex<HashSet<PeerId>>>) -> Self {
+    pub fn new(max: usize, blocked: Arc<Mutex<HashSet<PeerId>>>, nat_sim: bool) -> Self {
         IpLimit {
             max,
             blocked,
             pending: HashMap::new(),
             established: HashMap::new(),
+            holes: nat_sim.then(HashMap::new),
+        }
+    }
+
+    fn open_hole(&mut self, a: &Multiaddr) {
+        let (Some(holes), Some(h)) = (self.holes.as_mut(), hole_of(a)) else {
+            return;
+        };
+        if holes.len() >= HOLES_MAX {
+            holes.retain(|_, at| at.elapsed() < HOLE_TTL);
+        }
+        if holes.len() < HOLES_MAX {
+            holes.insert(h, Instant::now());
+        }
+    }
+
+    fn deny_unsolicited(&self, remote: &Multiaddr) -> Result<(), ConnectionDenied> {
+        let Some(holes) = &self.holes else {
+            return Ok(());
+        };
+        let open = hole_of(remote)
+            .and_then(|h| holes.get(&h))
+            .is_some_and(|at| at.elapsed() < HOLE_TTL);
+        if open {
+            Ok(())
+        } else {
+            Err(ConnectionDenied::new("simulated nat: unsolicited inbound"))
         }
     }
 
@@ -355,6 +400,7 @@ impl NetworkBehaviour for IpLimit {
         _local: &Multiaddr,
         remote: &Multiaddr,
     ) -> Result<(), ConnectionDenied> {
+        self.deny_unsolicited(remote)?;
         let source = conn_source(remote);
         if self.count(source) >= self.max {
             return Err(ConnectionDenied::new(format!(
@@ -380,15 +426,29 @@ impl NetworkBehaviour for IpLimit {
         Ok(dummy::ConnectionHandler)
     }
 
+    fn handle_pending_outbound_connection(
+        &mut self,
+        _id: ConnectionId,
+        _peer: Option<PeerId>,
+        addrs: &[Multiaddr],
+        _role: Endpoint,
+    ) -> Result<Vec<Multiaddr>, ConnectionDenied> {
+        for a in addrs {
+            self.open_hole(a);
+        }
+        Ok(vec![])
+    }
+
     fn handle_established_outbound_connection(
         &mut self,
         _id: ConnectionId,
         peer: PeerId,
-        _addr: &Multiaddr,
+        addr: &Multiaddr,
         _role: Endpoint,
         _port_use: PortUse,
     ) -> Result<THandler<Self>, ConnectionDenied> {
         self.deny_blocked(&peer)?;
+        self.open_hole(addr);
         Ok(dummy::ConnectionHandler)
     }
 
