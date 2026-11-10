@@ -1,6 +1,7 @@
 //! Sessions, channels and join codes on top of `cosmos-net`.
 
 pub mod channel;
+pub mod code;
 pub mod session;
 pub mod transport;
 
