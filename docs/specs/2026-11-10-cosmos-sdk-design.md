@@ -47,7 +47,7 @@ While on the Steam relay, the SDK keeps retrying direct in the background and mi
 | `cosmos-node` | optional daemon process hosting facades for unchanged games | from bb-p2p `node` |
 | `facades/*` | fake an existing backend (first: shadNet; later Steam P2P/EOS shims) | bb-p2p `facade` (generic parts only) |
 
-Game-specific logic (Bloodborne world/chalice) stays in a game port, which becomes the first consumer.
+`cosmos-node` and `facades/*` come after the demo. Game-specific logic (e.g. Bloodborne world/chalice) never enters the SDK; other games are separate consumers, done later.
 
 ### C API shape (sketch)
 ```c
@@ -75,10 +75,10 @@ void       cosmos_shutdown(cosmos_t*);
 ## Testing
 - Unit TDD per crate; loopback 4-peer integration test (sync + async + forced Steam-relay (test double) → direct migration).
 - 2-PC test (two LAN PCs), cross-network test (a remote friend), Steam path test with two Steam accounts.
-- Proof game: Bloodborne via a game port on the SDK, then **Cosmos Demo**, our own showcase game (below).
+- Proof: **Cosmos Demo** only — our own example game, shipped in the SDK (below). Tests with other games come after.
 
-## Showcase game: Cosmos Demo
-Small original top-down 2D co-op game in C + raylib (zlib license), single window, uses only `cosmos.h`, so it proves the C API.
+## Example game: Cosmos Demo
+Part of the SDK (`examples/cosmos-demo`). Small original top-down 2D co-op game in C + raylib (zlib license), single window, uses only `cosmos.h`, so it proves the C API.
 - 1–4 players fly around a small arena and collect stars together (sync plane: positions unreliable, pickups reliable, host decides).
 - Players can leave short notes on the floor; other sessions see them later, and a faint ghost replay of past players (async plane, DHT records).
 - HUD shows the current path per peer (direct / punched / Steam relay) so migration is visible live.

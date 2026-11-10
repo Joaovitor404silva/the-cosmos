@@ -3,7 +3,7 @@
 Spec: `docs/specs/2026-11-10-cosmos-sdk-design.md`. Workflow: unit TDD per task (red test first), opus medium implements new pieces, one opus review per milestone, live tests run by the supervisor. Build with `CARGO_BUILD_JOBS=2`.
 
 ## M0 — Skeleton
-- [ ] Workspace `cosmos-net`, `cosmos-core`, `cosmos-steam`, `cosmos-ffi`, `cosmos-node`; CI-free `cargo test` green.
+- [ ] Workspace `cosmos-net`, `cosmos-core`, `cosmos-steam`, `cosmos-ffi`; CI-free `cargo test` green.
 - [ ] Copy (not move) bb-p2p `mesh` into `cosmos-net`; strip Bloodborne names and the relay server/client + DEFAULT_RELAYS; remaining tests pass.
 - [ ] DHT-signaled hole punch (signed observed addresses + simultaneous dial) replaces relay-coordinated dcutr; `NO_PATH` error when nothing works.
 
@@ -33,13 +33,14 @@ Spec: `docs/specs/2026-11-10-cosmos-sdk-design.md`. Workflow: unit TDD per task 
 - [ ] `cosmos-ffi` poll API per spec; cbindgen `cosmos.h`; C example (`examples/chat.c`) with 4 instances.
 - [ ] DLL builds for Windows x64; panic-safe boundary (test).
 
-## M6 — Bloodborne on the SDK
-- [ ] a game port swaps its `mesh` for `cosmos-net`/`cosmos-core`; world records via the record API; shadNet facade moves to `cosmos-node` facades.
-- [ ] Live: same summon + messages test as 2026-10-25 (this PC + a remote friend), plus cross-network.
-
-## M7 — Showcase game + hardening
-- [ ] Cosmos Demo (`examples/cosmos-demo`, C + raylib): arena + stars + join code (sync), notes + ghosts (async), path HUD.
+## M6 — Cosmos Demo (example game, ships in the SDK)
+- [ ] `examples/cosmos-demo`, C + raylib: arena + stars + join code (sync), notes + ghosts (async), path HUD.
 - [ ] Live: 4 instances on 2 PCs, then cross-network with a remote friend; record a short showcase clip.
+
+## M7 — Hardening
 - [ ] Security audit of the whole SDK before any public release.
+
+## Later (not in this plan)
+- `cosmos-node` daemon + facades, then other games (Bloodborne via a game port first).
 
 Done = each milestone's tests green, opus review clean, live checks passed and recorded here.
