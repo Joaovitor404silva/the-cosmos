@@ -28,6 +28,7 @@ const VERSION: u8 = 1;
 const MAX_ADDRS: usize = 16;
 /// Republish interval; must stay under the node's record TTL.
 const REFRESH: Duration = Duration::from_secs(60);
+const RETRY: Duration = Duration::from_secs(5);
 const RESOLVE_DEADLINE: Duration = Duration::from_secs(20);
 
 /// Uppercase, drop separators, map look-alikes (O->0, I/L->1). `None` if not
@@ -264,13 +265,23 @@ pub async fn advertise(node: &Node, namespace: &str, addrs: Vec<Multiaddr>) -> a
     let (ns, c) = (namespace.to_string(), code.clone());
     let CodeKeys { topic, secret } = tokio::task::spawn_blocking(move || keys(&ns, &c)).await?;
     let data = advert.encode(namespace);
-    node.publish(&topic, data.clone()).await?;
+    // A lone host (empty mesh) cannot reach a DHT quorum. The record is
+    // already held locally and served to whoever finds us, so keep hosting
+    // and retry quickly until a put lands.
+    let mut stored = match node.publish(&topic, data.clone()).await {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::info!("advert not stored on the DHT yet: {e:#}");
+            false
+        }
+    };
     let node = node.clone();
     let task = tokio::spawn(async move {
         loop {
-            tokio::time::sleep(REFRESH).await;
-            if let Err(e) = node.publish(&topic, data.clone()).await {
-                tracing::debug!("advert refresh failed: {e:#}");
+            tokio::time::sleep(if stored { REFRESH } else { RETRY }).await;
+            match node.publish(&topic, data.clone()).await {
+                Ok(()) => stored = true,
+                Err(e) => tracing::debug!("advert refresh failed: {e:#}"),
             }
         }
     });

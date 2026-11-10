@@ -324,7 +324,12 @@ int main(int argc, char **argv) {
             if (f) { if (!fgets(from_file, sizeof from_file, f)) from_file[0] = 0; fclose(f); }
             if (strlen(from_file) >= 9) game_join(g, from_file);
         }
-        if (g) game_update(g, plat_now());
+        if (g) {
+            int was = g->state;
+            game_update(g, plat_now());
+            if (g->state >= ST_FAILED && was < ST_FAILED) fprintf(stderr, "%s\n", g->status);
+        }
+        if (!g && err[0] && host_now) { fprintf(stderr, "%s\n", err); host_now = 0; }
         if (g && g->state == ST_PLAYING && game_me(g)) {
             if (played == 0 && g->is_host) printf("join code %s\n", g->code); /* for scripts */
             if (bot && played < 3 && played + GetFrameTime() >= 3)

@@ -193,3 +193,20 @@ fn now() -> u64 {
         .unwrap()
         .as_secs()
 }
+
+/// A host alone on the network (nobody to store its advert) must still host,
+/// and a joiner who finds it later must resolve the code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lone_host_advertises_and_late_joiner_resolves() {
+    let lone = Config { ipfs_bootstrap: vec![], ..base() };
+    let host = Node::start(lone.clone()).await.unwrap();
+    let addrs = advertise_self(&host).await;
+    let adv = timeout(Duration::from_secs(40), code::advertise(&host, NS, addrs))
+        .await
+        .expect("advertise hung")
+        .expect("lone host must be able to advertise");
+    let boot = host.listen_addrs().await.into_iter().find(|a| a.to_string().contains("/tcp/")).unwrap();
+    let joiner = Node::start(Config { bootstrap: vec![boot], ..lone }).await.unwrap();
+    let got = retry("resolve", || code::resolve(&joiner, NS, &adv.code)).await;
+    assert_eq!(got.host, host.peer_id());
+}
