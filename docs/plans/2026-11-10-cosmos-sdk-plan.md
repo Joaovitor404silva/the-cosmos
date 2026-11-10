@@ -37,8 +37,9 @@ Spec: `docs/specs/2026-11-10-cosmos-sdk-design.md`. Workflow: unit TDD per task 
 - [ ] a game port swaps its `mesh` for `cosmos-net`/`cosmos-core`; world records via the record API; shadNet facade moves to `cosmos-node` facades.
 - [ ] Live: same summon + messages test as 2026-10-25 (this PC + a remote friend), plus cross-network.
 
-## M7 — Second game + hardening
-- [ ] Second proof game (user picks) via a native hook mod using the C ABI.
+## M7 — Showcase game + hardening
+- [ ] Cosmos Demo (`examples/cosmos-demo`, C + raylib): arena + stars + join code (sync), notes + ghosts (async), path HUD.
+- [ ] Live: 4 instances on 2 PCs, then cross-network with a remote friend; record a short showcase clip.
 - [ ] Security audit of the whole SDK before any public release.
 
 Done = each milestone's tests green, opus review clean, live checks passed and recorded here.

@@ -75,11 +75,18 @@ void       cosmos_shutdown(cosmos_t*);
 ## Testing
 - Unit TDD per crate; loopback 4-peer integration test (sync + async + forced Steam-relay (test double) → direct migration).
 - 2-PC test (two LAN PCs), cross-network test (a remote friend), Steam path test with two Steam accounts.
-- Proof game: Bloodborne via a game port on the SDK, then one more ≤4-player game (any store).
+- Proof game: Bloodborne via a game port on the SDK, then **Cosmos Demo**, our own showcase game (below).
+
+## Showcase game: Cosmos Demo
+Small original top-down 2D co-op game in C + raylib (zlib license), single window, uses only `cosmos.h`, so it proves the C API.
+- 1–4 players fly around a small arena and collect stars together (sync plane: positions unreliable, pickups reliable, host decides).
+- Players can leave short notes on the floor; other sessions see them later, and a faint ghost replay of past players (async plane, DHT records).
+- HUD shows the current path per peer (direct / punched / Steam relay) so migration is visible live.
+- Host shows a join code; join by typing it, or Steam invite.
+- Ships as a demo zip: exe + cosmos.dll + steam_api64.dll.
 
 ## Repos
 - No GPL code.
 
 ## Open questions
-1. Second proof game (≤4 players, Steam version not required) — user to pick.
 2. Engine bindings later (Unity C#, UE plugin, UE4SS Lua) — after the C ABI is stable.
