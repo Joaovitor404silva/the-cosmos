@@ -2,17 +2,25 @@
 //! the few flat-API calls the Steam path needs.
 //!
 //! If the process already initialized Steam (a Steam game), its instance is
-//! reused and never shut down by us. Otherwise we load our bundled DLL and
-//! init with the configured AppID (480, Spacewar, by default); that only
-//! needs the Steam client running and logged in. Anything missing comes back
-//! as `Unavailable`, never a panic.
+//! reused and never shut down by us. If the game loaded Steam but has not
+//! initialized it yet, we stay off (`GameSteamNotReady`) rather than init it
+//! as another AppID. Otherwise we load our bundled DLL, by absolute path
+//! only, and init with the configured AppID (480, Spacewar, by default);
+//! that only needs the Steam client running and logged in. Anything missing
+//! comes back as `Unavailable`, never a panic.
+//!
+//! Reusing the game's Steam leaves its networking alone: we chain to its
+//! session callbacks instead of replacing them, never close its per-user
+//! sessions, and (if it set its own accept policy) only accept users Cosmos
+//! is talking to.
 
 use crate::backend::{SendError, SteamBackend, SteamEvent, SteamId};
 use libloading::Library;
 use std::ffi::c_void;
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 #[cfg(windows)]
 pub const DLL_NAME: &str = "steam_api64.dll";
@@ -21,15 +29,16 @@ pub const DLL_NAME: &str = "libsteam_api.so";
 #[cfg(target_os = "macos")]
 pub const DLL_NAME: &str = "libsteam_api.dylib";
 
-/// Env var with a full path to the Steam API library (dev builds).
+/// Env var with a full path to the Steam API library (debug builds only).
 pub const DLL_ENV: &str = "COSMOS_STEAM_API";
 
 #[derive(Clone, Debug)]
 pub struct SteamConfig {
     /// AppID for our own init; ignored when reusing the game's Steam.
     pub app_id: u32,
-    /// Library to load; default: `COSMOS_STEAM_API`, then the normal search
-    /// (next to the exe first).
+    /// Absolute path of the library to load (e.g. the copy shipped next to
+    /// the exe). Debug builds fall back to `COSMOS_STEAM_API`. No search path
+    /// is used.
     pub dll: Option<PathBuf>,
 }
 
@@ -46,6 +55,9 @@ pub enum Unavailable {
     SteamNotRunning,
     InitFailed(String),
     NotLoggedOn,
+    /// The process loaded Steam but hasn't initialized it: a Steam game that
+    /// is still starting. Try again later.
+    GameSteamNotReady,
 }
 
 impl fmt::Display for Unavailable {
@@ -56,6 +68,7 @@ impl fmt::Display for Unavailable {
             Unavailable::SteamNotRunning => f.write_str("Steam client not running"),
             Unavailable::InitFailed(e) => write!(f, "Steam init failed: {e}"),
             Unavailable::NotLoggedOn => f.write_str("Steam user not logged on"),
+            Unavailable::GameSteamNotReady => f.write_str("the game loaded Steam but has not initialized it yet"),
         }
     }
 }
@@ -67,9 +80,16 @@ impl std::error::Error for Unavailable {}
 const IDENTITY_STEAMID: i32 = 16;
 const SEND_UNRELIABLE_NO_NAGLE: i32 = 1;
 const SEND_RELIABLE_NO_NAGLE: i32 = 9;
+const SEND_AUTO_RESTART: i32 = 32;
 const CB_SESSION_REQUEST: i32 = 1251;
 const CB_SESSION_FAILED: i32 = 1252;
 const CFG_CALLBACK_SESSION_REQUEST: i32 = 204;
+const CFG_CALLBACK_SESSION_FAILED: i32 = 205;
+const CFG_SEND_BUFFER_SIZE: i32 = 9;
+const CFG_SCOPE_GLOBAL: i32 = 1;
+const CFG_GET_OK: i32 = 1;
+/// Our send buffer per session when we own Steam (default is 512 KiB).
+const SEND_BUFFER: i32 = 4 << 20;
 const E_OK: i32 = 1;
 const E_NO_CONNECTION: i32 = 3;
 const E_BUSY: i32 = 10;
@@ -145,6 +165,8 @@ type FnRecv = unsafe extern "C" fn(Iface, i32, *mut *mut Message, i32) -> i32;
 type FnSession = unsafe extern "C" fn(Iface, *const Identity) -> bool;
 type FnRelease = unsafe extern "C" fn(*mut Message);
 type FnSetGlobalPtr = unsafe extern "C" fn(Iface, i32, *mut c_void) -> bool;
+type FnSetGlobalI32 = unsafe extern "C" fn(Iface, i32, i32) -> bool;
+type FnGetConfig = unsafe extern "C" fn(Iface, i32, i32, isize, *mut i32, *mut c_void, *mut usize) -> i32;
 type FnRelayStatus = unsafe extern "C" fn(Iface, *mut c_void) -> i32;
 type FnPipe = unsafe extern "C" fn(i32);
 type FnNextCb = unsafe extern "C" fn(i32, *mut CallbackMsg) -> bool;
@@ -172,7 +194,6 @@ pub struct SteamApi {
     app_id: u32,
     borrowed: bool,
     pump: Mutex<()>,
-    failed: Mutex<Vec<SteamId>>,
     /// Ours to shut down (None when borrowed); `down` once we did.
     shutdown: Option<FnVoid>,
     down: RwLock<bool>,
@@ -183,19 +204,61 @@ pub struct SteamApi {
 unsafe impl Send for SteamApi {}
 unsafe impl Sync for SteamApi {}
 
-/// For the borrowed-Steam session-request callback (no user pointer there).
+/// Borrowed Steam: `AcceptSessionWithUser` + interface, and the game's own
+/// callbacks we chain to (0 = none). Steam callbacks carry no user pointer.
 static ACCEPT: OnceLock<(usize, usize)> = OnceLock::new();
+static PREV_REQUEST: AtomicUsize = AtomicUsize::new(0);
+static PREV_FAILED: AtomicUsize = AtomicUsize::new(0);
+/// SteamIDs Cosmos talks to; with a game accept policy, only these are
+/// accepted by us.
+static ALLOWED: Mutex<Vec<SteamId>> = Mutex::new(Vec::new());
+const ALLOWED_MAX: usize = 256;
+/// Session-failed queues, one per channel, all fed by every failure.
+static FAILED: Mutex<Vec<Weak<Mutex<Vec<SteamId>>>>> = Mutex::new(Vec::new());
 
-unsafe extern "C" fn on_session_request(req: *mut Identity) {
+fn note_failed(id: SteamId) {
+    let mut subs = FAILED.lock().unwrap();
+    subs.retain(|w| w.strong_count() > 0);
+    for q in subs.iter().filter_map(Weak::upgrade) {
+        q.lock().unwrap().push(id);
+    }
+}
+
+/// SAFETY: `p` is null or a callback struct whose first field is the remote
+/// `SteamNetworkingIdentity` (true for the session request and failure ones).
+unsafe fn remote_of(p: *const c_void) -> Option<Identity> {
+    (!p.is_null()).then(|| unsafe { std::ptr::read_unaligned(p as *const Identity) })
+}
+
+unsafe extern "C" fn on_session_request(req: *mut c_void) {
+    let prev = PREV_REQUEST.load(Ordering::Acquire);
+    if prev != 0 {
+        // SAFETY: `prev` is the callback the game installed, same signature.
+        unsafe { std::mem::transmute::<usize, unsafe extern "C" fn(*mut c_void)>(prev)(req) };
+    }
+    // SAFETY: Steam passes a `SteamNetworkingMessagesSessionRequest_t`.
+    let Some(id) = (unsafe { remote_of(req) }) else { return };
+    let ours = id.steam_id().is_some_and(|s| ALLOWED.lock().unwrap().contains(&s));
     if let Some(&(f, iface)) = ACCEPT.get()
-        && !req.is_null()
+        && (prev == 0 || ours)
     {
-        // SAFETY: `f` is `AcceptSessionWithUser` from the loaded library and
-        // `req` points at the callback's identity.
+        // SAFETY: `f` is `AcceptSessionWithUser` from the loaded library.
         unsafe {
             let accept: FnSession = std::mem::transmute(f);
-            accept(iface as Iface, req);
+            accept(iface as Iface, &id);
         }
+    }
+}
+
+unsafe extern "C" fn on_session_failed(info: *mut c_void) {
+    // SAFETY: Steam passes a `SteamNetworkingMessagesSessionFailed_t`.
+    if let Some(s) = unsafe { remote_of(info) }.and_then(|i| i.steam_id()) {
+        note_failed(s);
+    }
+    let prev = PREV_FAILED.load(Ordering::Acquire);
+    if prev != 0 {
+        // SAFETY: the game's own callback, same signature.
+        unsafe { std::mem::transmute::<usize, unsafe extern "C" fn(*mut c_void)>(prev)(info) };
     }
 }
 
@@ -221,13 +284,33 @@ fn already_loaded() -> Option<Library> {
 }
 
 fn open_lib(cfg: &SteamConfig) -> Result<Library, Unavailable> {
+    let env = if cfg!(debug_assertions) { std::env::var_os(DLL_ENV).map(PathBuf::from) } else { None };
     let path = cfg
         .dll
         .clone()
-        .or_else(|| std::env::var_os(DLL_ENV).map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from(DLL_NAME));
+        .or(env)
+        .ok_or_else(|| Unavailable::DllMissing("no Steam API path configured".into()))?;
+    if !path.is_absolute() {
+        return Err(Unavailable::DllMissing(format!("{}: path must be absolute", path.display())));
+    }
     // SAFETY: loading the Steamworks redistributable runs only its own init.
-    unsafe { Library::new(&path) }.map_err(|e| Unavailable::DllMissing(format!("{}: {e}", path.display())))
+    unsafe { load_abs(&path) }.map_err(|e| Unavailable::DllMissing(format!("{}: {e}", path.display())))
+}
+
+/// SAFETY: as `Library::new`. Dependencies resolve from the DLL's folder and
+/// System32 only, never the current directory or PATH.
+#[cfg(windows)]
+unsafe fn load_abs(path: &std::path::Path) -> Result<Library, libloading::Error> {
+    use libloading::os::windows::{LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32};
+    unsafe {
+        libloading::os::windows::Library::load_with_flags(path, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32)
+    }
+    .map(Into::into)
+}
+
+#[cfg(not(windows))]
+unsafe fn load_abs(path: &std::path::Path) -> Result<Library, libloading::Error> {
+    unsafe { Library::new(path) }
 }
 
 impl SteamApi {
@@ -252,6 +335,10 @@ impl SteamApi {
         let h_user: FnInt = sym(&lib, "SteamAPI_GetHSteamUser")?;
         // SAFETY: plain getter, valid before and after init.
         let borrowed = preloaded && unsafe { h_user() } != 0;
+        if preloaded && !borrowed {
+            // A Steam game mid-start: initing now would run it as our AppID.
+            return Err(Unavailable::GameSteamNotReady);
+        }
         if !borrowed {
             Self::init(&lib, cfg.app_id)?;
         }
@@ -274,11 +361,20 @@ impl SteamApi {
         if !unsafe { running() } {
             return Err(Unavailable::SteamNotRunning);
         }
-        // SAFETY: set before any Steam thread starts; Steam reads these at init.
-        unsafe {
-            std::env::set_var("SteamAppId", app_id.to_string());
-            std::env::set_var("SteamGameId", app_id.to_string());
+        let id = app_id.to_string();
+        let preset = std::env::var("SteamAppId").ok();
+        if preset.as_deref() != Some(&id) {
+            set_app_env(Some(&id))?;
         }
+        let r = Self::init_call(lib);
+        if preset.as_deref() != Some(&id) {
+            // Don't leak our AppID into child processes.
+            set_app_env(None)?;
+        }
+        r
+    }
+
+    fn init_call(lib: &Library) -> Result<(), Unavailable> {
         if let Ok(init) = sym::<FnInitFlat>(lib, "SteamAPI_InitFlat") {
             let mut err = [0u8; 1024];
             // SAFETY: `err` is the 1024-byte SteamErrMsg buffer.
@@ -330,6 +426,9 @@ impl SteamApi {
             free_cb: None,
         };
         let init_relay: FnIfaceVoid = t!(sym(&lib, "SteamAPI_ISteamNetworkingUtils_InitRelayNetworkAccess"));
+        let set_ptr: FnSetGlobalPtr = t!(sym(&lib, "SteamAPI_ISteamNetworkingUtils_SetGlobalConfigValuePtr"));
+        let set_i32: FnSetGlobalI32 = t!(sym(&lib, "SteamAPI_ISteamNetworkingUtils_SetGlobalConfigValueInt32"));
+        let get_cfg: FnGetConfig = t!(sym(&lib, "SteamAPI_ISteamNetworkingUtils_GetConfigValue"));
         let h_pipe: FnInt = t!(sym(&lib, "SteamAPI_GetHSteamPipe"));
         let shutdown: Option<FnVoid> = if borrowed { None } else { Some(t!(sym(&lib, "SteamAPI_Shutdown"))) };
         // SAFETY (whole block): Steam is initialized; accessors return live
@@ -354,12 +453,22 @@ impl SteamApi {
             init_relay(utils);
             let mut fns = fns;
             if borrowed {
-                // The game pumps callbacks; accept sessions from its thread.
-                let set: FnSetGlobalPtr = t!(sym(&lib, "SteamAPI_ISteamNetworkingUtils_SetGlobalConfigValuePtr"));
+                // The game pumps callbacks; we hook in from its thread,
+                // chaining to whatever it installed.
                 let _ = ACCEPT.set((fns.accept as usize, msgs as usize));
-                let cb: unsafe extern "C" fn(*mut Identity) = on_session_request;
-                set(utils, CFG_CALLBACK_SESSION_REQUEST, cb as *mut c_void);
+                let prev = |v: i32| {
+                    let (mut kind, mut out, mut n) = (0i32, 0usize, std::mem::size_of::<usize>());
+                    let r = get_cfg(utils, v, CFG_SCOPE_GLOBAL, 0, &mut kind, (&raw mut out).cast(), &mut n);
+                    if r == CFG_GET_OK { out } else { 0 }
+                };
+                PREV_REQUEST.store(prev(CFG_CALLBACK_SESSION_REQUEST), Ordering::Release);
+                PREV_FAILED.store(prev(CFG_CALLBACK_SESSION_FAILED), Ordering::Release);
+                let req: unsafe extern "C" fn(*mut c_void) = on_session_request;
+                let fail: unsafe extern "C" fn(*mut c_void) = on_session_failed;
+                set_ptr(utils, CFG_CALLBACK_SESSION_REQUEST, req as *mut c_void);
+                set_ptr(utils, CFG_CALLBACK_SESSION_FAILED, fail as *mut c_void);
             } else {
+                set_i32(utils, CFG_SEND_BUFFER_SIZE, SEND_BUFFER);
                 let md_init: FnVoid = t!(sym(&lib, "SteamAPI_ManualDispatch_Init"));
                 md_init();
                 fns.run_frame = Some(t!(sym(&lib, "SteamAPI_ManualDispatch_RunFrame")));
@@ -376,7 +485,6 @@ impl SteamApi {
                 app_id,
                 borrowed,
                 pump: Mutex::new(()),
-                failed: Mutex::new(vec![]),
                 shutdown,
                 down: RwLock::new(false),
             })
@@ -430,7 +538,7 @@ impl SteamApi {
                     }
                     (CB_SESSION_FAILED, Some(id)) => {
                         if let Some(s) = id.steam_id() {
-                            self.failed.lock().unwrap().push(s);
+                            note_failed(s);
                         }
                     }
                     _ => {}
@@ -446,7 +554,11 @@ impl SteamApi {
             return Err(SendError::NoConnection);
         }
         let id = Identity::steam(to);
-        let flags = if reliable { SEND_RELIABLE_NO_NAGLE } else { SEND_UNRELIABLE_NO_NAGLE };
+        let mut flags = if reliable { SEND_RELIABLE_NO_NAGLE } else { SEND_UNRELIABLE_NO_NAGLE };
+        if self.borrowed {
+            // We never close the game's sessions; let Steam restart broken ones.
+            flags |= SEND_AUTO_RESTART;
+        }
         // SAFETY: valid identity and buffer for the duration of the call.
         let r = unsafe { (self.fns.send)(self.msgs, &id, data.as_ptr().cast(), data.len() as u32, flags, channel) };
         match r {
@@ -500,9 +612,11 @@ impl SteamApi {
         *down = true;
     }
 
+    /// Close our session with `peer`. Not when borrowed: the session is per
+    /// user and shared with the game's own channels.
     fn close_with(&self, peer: SteamId) {
         let down = self.down.read().unwrap();
-        if *down {
+        if *down || self.borrowed {
             return;
         }
         let id = Identity::steam(peer);
@@ -512,7 +626,33 @@ impl SteamApi {
 
     /// A backend on one networking-messages channel.
     pub fn channel(self: &Arc<Self>, channel: i32) -> Arc<SteamChannel> {
-        Arc::new(SteamChannel { api: self.clone(), channel })
+        let failed = Arc::new(Mutex::new(vec![]));
+        FAILED.lock().unwrap().push(Arc::downgrade(&failed));
+        Arc::new(SteamChannel { api: self.clone(), channel, failed })
+    }
+}
+
+#[cfg(windows)]
+fn set_app_env(v: Option<&str>) -> Result<(), Unavailable> {
+    // SAFETY: Windows environment calls are thread safe (the process
+    // environment is locked by the OS), so concurrent readers are fine.
+    unsafe {
+        for k in ["SteamAppId", "SteamGameId"] {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn set_app_env(v: Option<&str>) -> Result<(), Unavailable> {
+    // setenv races with getenv in other threads here: require it preset.
+    match v {
+        Some(_) => Err(Unavailable::InitFailed("set SteamAppId before starting threads".into())),
+        None => Ok(()),
     }
 }
 
@@ -520,6 +660,7 @@ impl SteamApi {
 pub struct SteamChannel {
     api: Arc<SteamApi>,
     channel: i32,
+    failed: Arc<Mutex<Vec<SteamId>>>,
 }
 
 impl SteamBackend for SteamChannel {
@@ -533,12 +674,22 @@ impl SteamBackend for SteamChannel {
 
     fn poll(&self, out: &mut Vec<SteamEvent>) {
         self.api.pump();
-        out.extend(self.api.failed.lock().unwrap().drain(..).map(|remote| SteamEvent::SessionFailed { remote }));
+        out.extend(self.failed.lock().unwrap().drain(..).map(|remote| SteamEvent::SessionFailed { remote }));
         self.api.receive(self.channel, out);
     }
 
     fn close(&self, peer: SteamId) {
         self.api.close_with(peer);
+    }
+
+    fn allow(&self, peer: SteamId) {
+        let mut a = ALLOWED.lock().unwrap();
+        if !a.contains(&peer) {
+            if a.len() >= ALLOWED_MAX {
+                a.remove(0);
+            }
+            a.push(peer);
+        }
     }
 }
 
@@ -548,12 +699,13 @@ mod tests {
 
     #[test]
     fn missing_dll_is_unavailable() {
+        // Only the loader: this can never init a Steam instance.
         let cfg = SteamConfig { app_id: 480, dll: Some(PathBuf::from("Z:/nope/not_steam_api64.dll")) };
-        match SteamApi::open(&cfg) {
-            Err(Unavailable::DllMissing(_)) => {}
-            // A Steam game test host could have it loaded already.
-            Err(e) => panic!("unexpected {e}"),
-            Ok(_) => {}
+        assert!(matches!(open_lib(&cfg), Err(Unavailable::DllMissing(_))));
+        let rel = SteamConfig { app_id: 480, dll: Some(PathBuf::from(DLL_NAME)) };
+        match open_lib(&rel) {
+            Err(Unavailable::DllMissing(e)) => assert!(e.contains("absolute"), "{e}"),
+            r => panic!("relative path not refused: {:?}", r.err()),
         }
     }
 

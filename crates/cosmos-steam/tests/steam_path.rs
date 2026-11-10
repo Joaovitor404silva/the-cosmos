@@ -70,11 +70,12 @@ async fn handshake_binds_and_frames_roundtrip() {
     b.t.send(a.id(), b"back".to_vec(), true).unwrap();
     assert_eq!(frame(&mut arx).await, (b.id(), b"back".to_vec()));
 
-    // Over the Steam message cap: refused, nothing sent.
-    let big = vec![0u8; cosmos_steam::MAX_FRAME + 1];
-    assert_eq!(a.t.send(b.id(), big, true), Err(TransportError::Backlog));
-    a.t.send(b.id(), vec![7; cosmos_steam::MAX_FRAME], true).unwrap();
-    assert_eq!(frame(&mut brx).await.1.len(), cosmos_steam::MAX_FRAME);
+    // Over one Steam message: split and rebuilt; over FRAME_MAX: refused.
+    let big: Vec<u8> = (0..cosmos_core::transport::FRAME_MAX).map(|i| i as u8).collect();
+    a.t.send(b.id(), big.clone(), true).unwrap();
+    assert_eq!(frame(&mut brx).await.1, big);
+    let over = vec![0u8; cosmos_core::transport::FRAME_MAX + 1];
+    assert_eq!(a.t.send(b.id(), over, true), Err(TransportError::Backlog));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -258,4 +259,101 @@ async fn pathset_migrates_off_steam_and_falls_back() {
     send_some(50, &mut next);
     collect(&mut brx, &mut got, next, aid).await;
     assert_eq!(got, (0..next).collect::<Vec<_>>(), "lost, duplicated or reordered frames");
+}
+
+async fn bound_pair(net: &Arc<FakeSteamNet>, dir: &Arc<StaticDirectory>) -> (Node, Node) {
+    let (a, b) = (node(net, SA, dir), node(net, SB, dir));
+    dir.insert(b.id(), SB);
+    a.t.connect(b.id(), vec![]).await.unwrap();
+    let end = Instant::now() + Duration::from_secs(3);
+    while b.t.bound_steam_id(a.id()).is_none() {
+        assert!(Instant::now() < end, "b never bound a");
+        sleep(Duration::from_millis(5)).await;
+    }
+    (a, b)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_fragment_never_corrupts_the_next_frame() {
+    let net = FakeSteamNet::new();
+    let dir = Arc::new(StaticDirectory::default());
+    let (a, b) = bound_pair(&net, &dir).await;
+    let mut brx = b.t.take_events().unwrap();
+    let big = vec![9u8; cosmos_steam::MAX_FRAME * 2];
+    // First piece goes out, second is refused: the frame is not sent.
+    net.full_after(1);
+    assert_eq!(a.t.send(b.id(), big.clone(), true), Err(TransportError::Backlog));
+    a.t.send(b.id(), b"small".to_vec(), true).unwrap();
+    assert_eq!(frame(&mut brx).await, (a.id(), b"small".to_vec()));
+    a.t.send(b.id(), big.clone(), true).unwrap();
+    assert_eq!(frame(&mut brx).await.1, big);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_sided_binding_is_repaired() {
+    let net = FakeSteamNet::new();
+    let dir = Arc::new(StaticDirectory::default());
+    let (a, b) = bound_pair(&net, &dir).await;
+    let mut brx = b.t.take_events().unwrap();
+    // Only b loses the session; a stays bound and keeps sending.
+    net.fail_session(SB, SA);
+    let end = Instant::now() + Duration::from_secs(3);
+    while b.t.bound_steam_id(a.id()).is_some() {
+        assert!(Instant::now() < end, "b never unbound");
+        sleep(Duration::from_millis(5)).await;
+    }
+    let got = timeout(Duration::from_secs(3), async {
+        loop {
+            let _ = a.t.send(b.id(), b"hi".to_vec(), true);
+            if let Ok(Some(TransportEvent::Frame { peer, data })) = timeout(Duration::from_millis(50), brx.recv()).await {
+                return (peer, data);
+            }
+        }
+    })
+    .await
+    .expect("b never accepted a's frames again");
+    assert_eq!(got, (a.id(), b"hi".to_vec()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rekeyed_peer_on_same_steam_id_rebinds() {
+    let net = FakeSteamNet::new();
+    let dir = Arc::new(StaticDirectory::default());
+    let (a, b) = bound_pair(&net, &dir).await;
+    let mut brx = b.t.take_events().unwrap();
+    let old = a.id();
+    drop(a);
+    sleep(Duration::from_millis(50)).await;
+    // Same Steam account, new Cosmos key.
+    let a2 = node(&net, SA, &dir);
+    a2.t.connect_steam(SB, Some(b.id())).await.unwrap();
+    let end = Instant::now() + Duration::from_secs(3);
+    while b.t.bound_steam_id(a2.id()) != Some(SA) {
+        assert!(Instant::now() < end, "b still binds SA to the old key");
+        sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(b.t.bound_steam_id(old), None);
+    let down = timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(TransportEvent::Down { peer }) = brx.recv().await {
+                return peer;
+            }
+        }
+    })
+    .await
+    .expect("no Down for the old key");
+    assert_eq!(down, old);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stranger_hellos_cannot_block_our_connects() {
+    let net = FakeSteamNet::new();
+    let dir = Arc::new(StaticDirectory::default());
+    let (a, b) = (node(&net, SA, &dir), node(&net, SB, &dir));
+    for i in 0..200u64 {
+        net.inject(SX + i, SA, bind::hello(&bind::new_nonce()));
+    }
+    sleep(Duration::from_millis(100)).await;
+    dir.insert(b.id(), SB);
+    a.t.connect(b.id(), vec![]).await.expect("strangers starved our handshake");
 }

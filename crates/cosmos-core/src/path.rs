@@ -578,9 +578,11 @@ async fn reconnect(w: Weak<Shared>, peer: PeerId, dead: usize, inc: u64) {
     }) else {
         return;
     };
-    let order = (0..paths.len()).filter(|&j| j != dead).chain([dead]);
-    for j in order {
-        if connect_on(paths[j].clone(), peer, addrs.clone(), Some(limit)).await.is_ok() {
+    let order: Vec<usize> = (0..paths.len()).filter(|&j| j != dead).chain([dead]).collect();
+    for (k, &j) in order.iter().enumerate() {
+        // The last try gets no limit (a slow relay still beats dropping).
+        let limit = (k + 1 < order.len()).then_some(limit);
+        if connect_on(paths[j].clone(), peer, addrs.clone(), limit).await.is_ok() {
             with_peer(&w, peer, inc, |s, p| {
                 p.live[j] = true;
                 if p.active.is_none() {

@@ -14,6 +14,13 @@ use libp2p_identity::PublicKey;
 pub const HELLO: u8 = 1;
 pub const PROOF: u8 = 2;
 pub const DATA: u8 = 3;
+/// A piece of a frame too big for one Steam message: `[FRAG][flags][chunk]`.
+pub const FRAG: u8 = 4;
+pub const FRAG_FIRST: u8 = 1;
+pub const FRAG_LAST: u8 = 2;
+/// `HELLO` sent in answer to a `HELLO`: answered with a proof only, never
+/// with another hello (so two re-proving sides can't ping-pong).
+pub const HELLO_BACK: u8 = 5;
 pub const NONCE: usize = 16;
 const DOMAIN: &[u8] = b"cosmos-steam-bind:v1";
 const MAX_KEY: usize = 1024;
@@ -27,13 +34,18 @@ pub fn new_nonce() -> Nonce {
 }
 
 pub fn hello(nonce: &Nonce) -> Vec<u8> {
-    let mut m = vec![HELLO];
+    hello_kind(HELLO, nonce)
+}
+
+pub fn hello_kind(kind: u8, nonce: &Nonce) -> Vec<u8> {
+    let mut m = vec![kind];
     m.extend_from_slice(nonce);
     m
 }
 
+/// Nonce of a `HELLO` or `HELLO_BACK`.
 pub fn parse_hello(m: &[u8]) -> Option<Nonce> {
-    (m.len() == 1 + NONCE && m[0] == HELLO).then(|| m[1..].try_into().unwrap())
+    (m.len() == 1 + NONCE && (m[0] == HELLO || m[0] == HELLO_BACK)).then(|| m[1..].try_into().unwrap())
 }
 
 fn signed(signer: SteamId, receiver: SteamId, nonce: &Nonce) -> Vec<u8> {
