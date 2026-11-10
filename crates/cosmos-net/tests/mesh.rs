@@ -510,6 +510,9 @@ async fn peer_cache_reconnects_after_restart_without_bootstrap() {
         std::fs::read_to_string(&path).unwrap().trim()
     );
     assert_eq!(via, Some("cache"));
+    drop(ev);
+    drop(a2);
+    tokio::time::sleep(Duration::from_millis(500)).await;
     let _ = std::fs::remove_file(path);
 }
 
