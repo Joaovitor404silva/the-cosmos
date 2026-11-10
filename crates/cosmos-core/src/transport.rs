@@ -197,6 +197,10 @@ impl Transport for MemTransport {
     }
 }
 
+/// Largest frame a transport carries: the biggest channel payload plus
+/// channel and path headers. Fixed, so peers never disagree on it.
+pub const FRAME_MAX: usize = crate::channel::CAP_MAX + 64;
+
 /// Bytes queued per peer before reliable sends fail with `Backlog`.
 const RELIABLE_QUEUE: usize = 8 << 20;
 /// Bytes queued per peer before unreliable frames are dropped.
@@ -236,7 +240,7 @@ impl Drop for NetTransport {
 
 impl NetTransport {
     /// Takes the node's inbound sync streams; one transport per node.
-    pub fn new(node: Node, max_frame: usize) -> anyhow::Result<Arc<Self>> {
+    pub fn new(node: Node) -> anyhow::Result<Arc<Self>> {
         let mut inbound = node
             .sync_streams()
             .ok_or_else(|| anyhow::anyhow!("sync streams already taken"))?;
@@ -247,7 +251,7 @@ impl NetTransport {
             readers: Mutex::new(HashMap::new()),
             next_id: AtomicUsize::new(0),
             events,
-            max_frame,
+            max_frame: FRAME_MAX,
         });
         let s = shared.clone();
         let accept = tokio::spawn(async move {
