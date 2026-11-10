@@ -97,7 +97,7 @@ fn sw(a: &str, b: &str) -> (String, String) {
     (a.into(), b.into())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn relay_to_direct_and_back_loses_nothing() {
     let (direct, relay) = (MemNet::new(), MemNet::new());
     direct.cut();
@@ -138,7 +138,7 @@ async fn relay_to_direct_and_back_loses_nothing() {
     assert_eq!(p.hps.unacked_bytes(m), 0, "resend buffer not drained by acks");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn flapping_direct_does_not_cause_a_switch_storm() {
     let (direct, relay) = (MemNet::new(), MemNet::new());
     direct.cut();
@@ -171,7 +171,7 @@ async fn flapping_direct_does_not_cause_a_switch_storm() {
     assert_eq!(p.hs.switches, vec![sw("relay", "direct")]);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn resend_cap_overflow_drops_the_peer() {
     let relay = MemNet::new();
     let r: Arc<dyn Transport> = relay.transport();
@@ -198,4 +198,121 @@ async fn resend_cap_overflow_drops_the_peer() {
     assert!(a.live_paths(bp).is_empty());
     assert_eq!(a.unacked_bytes(bp), 0);
     assert_eq!(a.send(bp, vec![1], true), Err(TransportError::Closed));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn blackholed_direct_falls_back_to_relay() {
+    let (direct, relay) = (MemNet::new(), MemNet::new());
+    let mut p = Pair::new(&direct, &relay).await;
+    assert!(p.on("direct"), "did not start on direct");
+    // No Down from the transport: only missing acks reveal it.
+    direct.set_blackhole(true);
+    for i in 0..300u32 {
+        p.send(i);
+        if i % 10 == 9 {
+            sleep(Duration::from_millis(5)).await;
+            p.drain();
+        }
+    }
+    p.wait("fallback to the relay", |p| p.on("relay")).await;
+    p.wait("all reliable messages", |p| p.ms.rel.len() >= 300).await;
+    assert_eq!(p.ms.rel, (0..300).collect::<Vec<_>>(), "reliable lost, duplicated or reordered");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn blackholed_direct_is_never_adopted() {
+    let (direct, relay) = (MemNet::new(), MemNet::new());
+    direct.cut();
+    let mut p = Pair::new(&direct, &relay).await;
+    assert!(p.on("relay"));
+    // Connects succeed but nothing gets through: probing must notice.
+    direct.restore();
+    direct.set_blackhole(true);
+    for i in 0..200u32 {
+        p.send(i);
+        sleep(Duration::from_millis(5)).await;
+        p.drain();
+    }
+    p.wait("all reliable messages", |p| p.ms.rel.len() >= 200).await;
+    assert!(p.on("relay"), "moved to a path that carries nothing");
+    assert!(p.hs.switches.is_empty() && p.ms.switches.is_empty(), "switched: {:?}", p.hs.switches);
+    assert_eq!(p.ms.rel, (0..200).collect::<Vec<_>>());
+}
+
+fn single(net: &Arc<MemNet>, c: PathConfig) -> Arc<PathSet> {
+    let t: Arc<dyn Transport> = net.transport();
+    PathSet::new(vec![("relay".into(), t)], c).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forgotten_peer_resets_the_sender() {
+    let net = MemNet::new();
+    let (a, b) = (single(&net, cfg()), single(&net, cfg()));
+    let (mut ae, mut be) = (a.take_events().unwrap(), b.take_events().unwrap());
+    let (ap, bp) = (a.local_peer(), b.local_peer());
+    a.connect(bp, vec![]).await.unwrap();
+    a.send(bp, b"x".to_vec(), true).unwrap();
+    let ev = timeout(Duration::from_secs(2), be.recv()).await.unwrap().unwrap();
+    assert!(matches!(ev, TransportEvent::Frame { .. }), "{ev:?}");
+    let end = Instant::now() + Duration::from_secs(2);
+    while a.unacked_bytes(bp) > 0 {
+        assert!(Instant::now() < end, "never acked");
+        sleep(Duration::from_millis(5)).await;
+    }
+    // b drops a (say its side gave up); a still thinks the link is fine.
+    b.disconnect(ap);
+    a.send(bp, b"y".to_vec(), true).unwrap();
+    let down = timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(TransportEvent::Down { peer }) = ae.recv().await {
+                return peer;
+            }
+        }
+    })
+    .await
+    .expect("sender never learned the receiver forgot it");
+    assert_eq!(down, bp);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn strangers_hold_bounded_state() {
+    let net = MemNet::new();
+    let a = single(&net, cfg());
+    let _ae = a.take_events().unwrap();
+    let mut held = vec![];
+    for _ in 0..40 {
+        let t = net.transport();
+        let _ = t.take_events();
+        let mut f = vec![1u8];
+        f.extend_from_slice(&7u32.to_be_bytes());
+        f.extend_from_slice(&0u64.to_be_bytes());
+        f.extend_from_slice(b"hi");
+        t.send(a.local_peer(), f, true).unwrap();
+        held.push(t);
+    }
+    sleep(Duration::from_millis(200)).await;
+    let known = held.iter().filter(|t| !a.live_paths(t.local_peer()).is_empty()).count();
+    assert!(known <= 8, "state kept for {known} strangers");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resend_backs_off_and_is_windowed() {
+    let net = MemNet::new();
+    let a = single(&net, PathConfig { rto: Duration::from_millis(100), ..cfg() });
+    let _ae = a.take_events().unwrap();
+    // A peer that never acks.
+    let b = net.transport();
+    let mut be = b.take_events().unwrap();
+    let bp = b.local_peer();
+    a.connect(bp, vec![]).await.unwrap();
+    for _ in 0..200 {
+        a.send(bp, vec![0; 10], true).unwrap();
+    }
+    sleep(Duration::from_millis(1500)).await;
+    let mut n = 0;
+    while be.try_recv().is_ok() {
+        n += 1;
+    }
+    // Without backoff or a window: ~15 rounds x 200 frames.
+    assert!(n < 1000, "resend storm: {n} frames in 1.5 s");
 }
