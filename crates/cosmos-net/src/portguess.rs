@@ -1,4 +1,3 @@
-use libp2p::StreamProtocol;
 use sha2::{Digest, Sha256};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -8,12 +7,11 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::{Instant, MissedTickBehavior};
 
-pub const PROTO: StreamProtocol = StreamProtocol::new("/bb/portguess/1.0.0");
 pub const MAX_PPS: u32 = 100;
 pub const MAX_SOCKETS: usize = 256;
 pub const MAX_SPRAY: Duration = Duration::from_secs(20);
 pub const OFFER_LEN: usize = 16 + 4 + 2;
-const MAGIC: [u8; 4] = *b"BBPG";
+const MAGIC: [u8; 4] = *b"CSPG";
 const PROBE: u8 = 1;
 const ACK: u8 = 2;
 const PACKET_LEN: usize = 4 + 1 + 16;

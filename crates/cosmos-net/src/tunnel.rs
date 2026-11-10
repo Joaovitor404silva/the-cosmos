@@ -10,7 +10,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-pub const PROTOCOL: StreamProtocol = StreamProtocol::new("/bb/udp-tunnel/2.0.0");
+pub const PROTOCOL: StreamProtocol = StreamProtocol::new("/cosmos/udp-tunnel/1.0.0");
 pub const ACCEPT: u8 = 1;
 pub const REJECT: u8 = 0;
 const CLOSE: u16 = 0xFFFF;

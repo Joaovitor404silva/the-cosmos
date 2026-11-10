@@ -8,7 +8,7 @@ use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::time::Instant;
 
-pub const PROTO: StreamProtocol = StreamProtocol::new("/bb/rpc/1.0.0");
+pub const PROTO: StreamProtocol = StreamProtocol::new("/cosmos/rpc/1.0.0");
 const CHUNK: usize = 8 << 10;
 const PEER_TABLE_MAX: usize = 4096;
 

@@ -192,8 +192,8 @@ struct Behaviour {
 const RPC_TIMEOUT: Duration = Duration::from_secs(15);
 const FIND_DEADLINE: Duration = Duration::from_secs(20);
 pub const MAX_FIND_PROVIDERS: usize = 32;
-const BB_GOOD_MAX: usize = 4096;
-const REC_PROTO: StreamProtocol = StreamProtocol::new("/bb/rec/1.0.0");
+const GOOD_MAX: usize = 4096;
+const REC_PROTO: StreamProtocol = StreamProtocol::new("/cosmos/rec/1.0.0");
 const REC_MAX: usize = 320 << 10;
 const REC_TOPIC_MAX: usize = 1024;
 const REC_SERVE_MAX: usize = 16;
@@ -366,7 +366,7 @@ pub struct Node {
     permanently_blocked: HashSet<PeerId>,
 }
 
-const KAD_PROTO: StreamProtocol = StreamProtocol::new("/bb/kad/1.0.0");
+const KAD_PROTO: StreamProtocol = StreamProtocol::new("/cosmos/kad/1.0.0");
 const ANCHOR_BACKOFF: Duration = Duration::from_millis(500);
 const ANCHOR_BACKOFF_MAX: Duration = Duration::from_secs(30);
 const TUNNEL_BACKOFF: Duration = Duration::from_millis(200);
@@ -515,7 +515,7 @@ fn kad_addr_allowed(addr: &Multiaddr, via: Option<&Multiaddr>, mdns_peer: bool) 
 }
 
 fn identify_config(key: libp2p::identity::PublicKey) -> identify::Config {
-    identify::Config::new("/bb/id/1.0.0".into(), key)
+    identify::Config::new("/cosmos/id/1.0.0".into(), key)
         .with_hide_listen_addrs(true)
         .with_push_listen_addr_updates(true)
         .with_interval(Duration::from_secs(30))
@@ -753,9 +753,9 @@ impl Node {
             cache,
             cache_saved: now,
             seeds,
-            bb_peers: HashSet::new(),
-            bb_good: HashSet::new(),
-            bb_bootstrap_at: now,
+            mesh_peers: HashSet::new(),
+            good_peers: HashSet::new(),
+            mesh_bootstrap_at: now,
             fallback_at,
             ipfs_ready: false,
             ipfs_pending: HashMap::new(),
@@ -1080,9 +1080,9 @@ struct EventLoop {
     cache: Option<discovery::PeerCache>,
     cache_saved: Instant,
     seeds: HashMap<PeerId, &'static str>,
-    bb_peers: HashSet<PeerId>,
-    bb_good: HashSet<PeerId>,
-    bb_bootstrap_at: Instant,
+    mesh_peers: HashSet<PeerId>,
+    good_peers: HashSet<PeerId>,
+    mesh_bootstrap_at: Instant,
     fallback_at: Option<Instant>,
     ipfs_ready: bool,
     ipfs_pending: HashMap<kad::QueryId, IpfsQuery>,
@@ -1134,7 +1134,7 @@ const MAX_DIRECT_DIAL: usize = 8;
 const IPFS_REPROVIDE_MIN: Duration = Duration::from_secs(30);
 const IPFS_LOOKUP_FOUND: Duration = Duration::from_secs(300);
 const CACHE_SAVE_EVERY: Duration = Duration::from_secs(2);
-const BB_BOOTSTRAP_EVERY: Duration = Duration::from_secs(5);
+const MESH_BOOTSTRAP_EVERY: Duration = Duration::from_secs(5);
 
 impl EventLoop {
     async fn run(
@@ -1326,8 +1326,8 @@ impl EventLoop {
                 }
             }
             Command::RpcOk { peer } => {
-                if self.bb_good.len() < BB_GOOD_MAX || self.bb_good.contains(&peer) {
-                    self.bb_good.insert(peer);
+                if self.good_peers.len() < GOOD_MAX || self.good_peers.contains(&peer) {
+                    self.good_peers.insert(peer);
                     if let Some(c) = self.cache.as_mut() {
                         c.good(peer);
                     }
@@ -1773,7 +1773,7 @@ impl EventLoop {
         if let Some(at) = self.fallback_at {
             if now >= at {
                 self.fallback_at = None;
-                if self.bb_peers.is_empty() {
+                if self.mesh_peers.is_empty() {
                     if let Some(url) = self.cfg.bootstrap_url.clone() {
                         let inner = self.inner_tx.clone();
                         tokio::task::spawn_blocking(move || {
@@ -1828,7 +1828,7 @@ impl EventLoop {
             }
         }
         if now >= self.ipfs_next_lookup {
-            let found_any = self.ipfs_found.iter().any(|p| self.bb_peers.contains(p));
+            let found_any = self.ipfs_found.iter().any(|p| self.mesh_peers.contains(p));
             self.ipfs_next_lookup = now
                 + if found_any {
                     IPFS_LOOKUP_FOUND
@@ -1925,7 +1925,7 @@ impl EventLoop {
                                     let keep: HashSet<PeerId> = self
                                         .ipfs_found
                                         .iter()
-                                        .filter(|q| self.bb_peers.contains(q))
+                                        .filter(|q| self.mesh_peers.contains(q))
                                         .copied()
                                         .collect();
                                     self.ipfs_found = keep;
@@ -2087,8 +2087,8 @@ impl EventLoop {
             .map(store::StoreSource::Ip)
     }
 
-    fn on_bb_peer(&mut self, peer: PeerId, addrs: Vec<Multiaddr>) {
-        let new = self.bb_peers.insert(peer);
+    fn on_mesh_peer(&mut self, peer: PeerId, addrs: Vec<Multiaddr>) {
+        let new = self.mesh_peers.insert(peer);
         if let Some(c) = self.cache.as_mut() {
             c.seen(peer, addrs);
         }
@@ -2096,8 +2096,8 @@ impl EventLoop {
             self.emit(Event::Discovered { peer, via });
         }
         let now = Instant::now();
-        if new && now >= self.bb_bootstrap_at {
-            self.bb_bootstrap_at = now + BB_BOOTSTRAP_EVERY;
+        if new && now >= self.mesh_bootstrap_at {
+            self.mesh_bootstrap_at = now + MESH_BOOTSTRAP_EVERY;
             let _ = self.swarm.behaviour_mut().kad.bootstrap();
         }
     }
@@ -2262,7 +2262,7 @@ impl EventLoop {
                     let mut providers: Vec<_> = providers.into_iter().collect();
                     providers.sort_by_key(|peer| {
                         !(self.allowed.contains(peer)
-                            || self.bb_good.contains(peer)
+                            || self.good_peers.contains(peer)
                             || self.anchors.iter().any(|anchor| anchor.peer == *peer)
                             || self.connected(peer))
                     });
@@ -2415,7 +2415,7 @@ impl EventLoop {
                     let base = split_peer(&addr)
                         .map(|(_, base)| base)
                         .unwrap_or_else(|| addr.clone());
-                    if self.bb_peers.contains(&peer_id)
+                    if self.mesh_peers.contains(&peer_id)
                         || self.anchors.iter().any(|anchor| anchor.peer == peer_id)
                         || (local_only && scope == Scope::Loopback)
                     {
@@ -2468,7 +2468,7 @@ impl EventLoop {
                     self.conns.remove(&peer_id);
                     self.rec_peer_slots.remove(&peer_id);
                     self.peer_direct.remove(&peer_id);
-                    self.bb_peers.remove(&peer_id);
+                    self.mesh_peers.remove(&peer_id);
                     self.emit(Event::Disconnected { peer: peer_id });
                 }
             }
@@ -2596,7 +2596,7 @@ impl EventLoop {
                         }
                     }
                     self.peer_direct.insert(peer_id, direct);
-                    self.on_bb_peer(peer_id, good);
+                    self.on_mesh_peer(peer_id, good);
                 }
             }
             BehaviourEvent::Ipfs(e) => self.on_ipfs(e),
@@ -2668,7 +2668,7 @@ impl EventLoop {
                     .and_then(discovery::ip_of)
                     .map(rpc::Bucket::Ip)
                     .unwrap_or(rpc::Bucket::Unknown);
-                let trusted = self.allowed.contains(&peer) || self.bb_good.contains(&peer);
+                let trusted = self.allowed.contains(&peer) || self.good_peers.contains(&peer);
                 match self.gate.admit_bucket(peer, bucket, trusted) {
                     Ok(permit) => {
                         tokio::spawn(rpc::serve(permit, stream, self.rpc_tx.clone()));
@@ -2730,8 +2730,9 @@ fn is_unspecified(a: &Multiaddr) -> bool {
     })
 }
 
-pub fn topic_for(area: &str, level_band: u32) -> String {
-    format!("bb:{area}:{level_band}")
+/// Topic for one kind of record inside one game's namespace.
+pub fn topic_for(namespace: &str, kind: &str) -> String {
+    format!("{namespace}:{kind}")
 }
 
 #[cfg(test)]

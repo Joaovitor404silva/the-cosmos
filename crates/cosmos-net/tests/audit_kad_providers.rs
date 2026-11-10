@@ -105,7 +105,7 @@ fn attacker() -> Swarm<kad::Behaviour<MemoryStore>> {
             let mut b = kad::Behaviour::with_config(
                 id,
                 MemoryStore::with_config(id, scfg),
-                kad::Config::new(StreamProtocol::new("/bb/kad/1.0.0")),
+                kad::Config::new(StreamProtocol::new("/cosmos/kad/1.0.0")),
             );
             b.set_mode(Some(kad::Mode::Client));
             b
@@ -156,7 +156,7 @@ async fn one_fake_provider_without_record_breaks_find_complete() {
     let c = Node::start(base()).await.unwrap();
     let a = join(&c).await;
     let b = join(&c).await;
-    let topic = cosmos_net::topic_for("audit_area", 1);
+    let topic = cosmos_net::topic_for("audit", "one");
     publish(&a, &topic).await.expect("honest publish");
     let honest = timeout(
         Duration::from_secs(25),
@@ -190,7 +190,7 @@ async fn one_fake_provider_without_record_breaks_find_complete() {
 async fn junk_provider_keys_exhaust_store_and_block_victim_publish() {
     let c = Node::start(base()).await.unwrap();
     let _a = join(&c).await;
-    publish(&c, &cosmos_net::topic_for("audit_area", 1))
+    publish(&c, &cosmos_net::topic_for("audit", "one"))
         .await
         .expect("control publish");
 
@@ -205,7 +205,7 @@ async fn junk_provider_keys_exhaust_store_and_block_victim_publish() {
     spawn_idle(evil);
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    let r = publish(&c, &cosmos_net::topic_for("audit_area", 2)).await;
+    let r = publish(&c, &cosmos_net::topic_for("audit", "two")).await;
     assert!(
         r.is_ok(),
         "victim cannot publish after 1100 junk AddProvider from one remote peer: {r:?}"

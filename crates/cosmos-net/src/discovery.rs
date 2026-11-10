@@ -46,7 +46,7 @@ pub fn ipfs_bootstrap() -> Vec<Multiaddr> {
 }
 
 pub fn provider_key(topic: &str) -> kad::RecordKey {
-    let digest = Sha256::digest(format!("bb-p2p/v1/{topic}").as_bytes());
+    let digest = Sha256::digest(format!("cosmos/v1/{topic}").as_bytes());
     let mut k = vec![0x12, 0x20];
     k.extend_from_slice(&digest);
     kad::RecordKey::new(&k)
@@ -700,7 +700,7 @@ mod tests {
 
     #[test]
     fn peer_cache_caps_and_expires() {
-        let path = std::env::temp_dir().join(format!("bb-cache-unit-{}.peers", PeerId::random()));
+        let path = std::env::temp_dir().join(format!("cosmos-cache-unit-{}.peers", PeerId::random()));
         let old = PeerId::random();
         std::fs::write(&path, format!("1 {old} /ip4/1.2.3.4/tcp/1\n")).unwrap();
         let mut c = PeerCache::load(path.clone());

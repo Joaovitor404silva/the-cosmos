@@ -13,7 +13,7 @@ async fn live_two_nodes_meet_through_public_ipfs_dht() {
     let cfg = || Config {
         ipfs: true,
         ipfs_topics: vec![topic.clone()],
-        ipfs_announce_lan: std::env::var("BB_IPFS_LAN").is_ok(),
+        ipfs_announce_lan: std::env::var("COSMOS_IPFS_LAN").is_ok(),
         mdns: false,
         ..Config::default()
     };

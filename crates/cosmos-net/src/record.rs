@@ -2,7 +2,7 @@ use libp2p::PeerId;
 use libp2p::identity::{Keypair, PublicKey};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const DOMAIN: &[u8] = b"bb-mesh-record:v1";
+const DOMAIN: &[u8] = b"cosmos-record:v1";
 pub const MAX_TTL: Duration = Duration::from_secs(1800);
 pub const CLOCK_SKEW: Duration = Duration::from_secs(120);
 
@@ -98,7 +98,7 @@ mod tests {
     #[test]
     fn sign_verify_and_tamper() {
         let k = Keypair::generate_ed25519();
-        let mut bytes = Record::sign(&k, "bb:a:1", b"hi".to_vec(), Duration::from_secs(60)).unwrap();
+        let mut bytes = Record::sign(&k, "game:kind", b"hi".to_vec(), Duration::from_secs(60)).unwrap();
         let rec = Record::verify(&bytes).unwrap();
         assert_eq!(rec.publisher, k.public().to_peer_id());
         assert_eq!(rec.data, b"hi");
@@ -111,14 +111,14 @@ mod tests {
     fn expiry_clamped_with_clock_skew() {
         let k = Keypair::generate_ed25519();
         let now = now_secs();
-        let at = |e: u64| Record::sign_expiring(&k, "bb:a:1", vec![1], e).unwrap();
+        let at = |e: u64| Record::sign_expiring(&k, "game:kind", vec![1], e).unwrap();
         assert!(Record::verify_at(&at(now + 10 * 365 * 86400), now).is_none(), "far future accepted");
         assert!(Record::verify_at(&at(now + MAX_TTL.as_secs() + 300), now).is_none());
         assert!(Record::verify_at(&at(now + MAX_TTL.as_secs() + 60), now).is_some(), "skew ahead rejected");
         assert!(Record::verify_at(&at(now - 60), now).is_some(), "skew behind rejected");
         assert!(Record::verify_at(&at(now - 300), now).is_none(), "stale accepted");
         assert!(Record::verify_at(&at(u64::MAX), now).is_none());
-        let long = Record::sign(&k, "bb:a:1", vec![1], Duration::from_secs(100 * 86400)).unwrap();
+        let long = Record::sign(&k, "game:kind", vec![1], Duration::from_secs(100 * 86400)).unwrap();
         assert!(Record::verify(&long).is_some(), "signer did not clamp ttl");
     }
 }

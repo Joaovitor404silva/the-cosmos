@@ -187,11 +187,11 @@ async fn mesh3() -> (Node, Node, Node) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn record_published_by_a_is_found_by_b_via_c() {
     let (_c, a, b) = mesh3().await;
-    let topic = cosmos_net::topic_for("cathedral_ward", 3);
+    let topic = cosmos_net::topic_for("demo", "lobby");
 
     let start = Instant::now();
     loop {
-        match a.publish(&topic, b"summon-sign:hunter-a".to_vec()).await {
+        match a.publish(&topic, b"lobby-advert:player-a".to_vec()).await {
             Ok(()) => break,
             Err(e) if start.elapsed() < Duration::from_secs(20) => {
                 eprintln!("publish retry: {e}");
@@ -207,9 +207,9 @@ async fn record_published_by_a_is_found_by_b_via_c() {
         .unwrap();
     assert_eq!(found.len(), 1, "found {found:?}");
     assert_eq!(found[0].publisher, a.peer_id());
-    assert_eq!(found[0].data, b"summon-sign:hunter-a");
+    assert_eq!(found[0].data, b"lobby-advert:player-a");
     assert_eq!(found[0].topic, topic);
-    assert!(b.find("bb:other:1").await.unwrap().is_empty());
+    assert!(b.find("demo:other").await.unwrap().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -234,7 +234,7 @@ async fn udp_echo_through_direct_tunnel() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gossip_subscribe_receives_signed_record() {
     let (_c, a, b) = mesh3().await;
-    let topic = cosmos_net::topic_for("forbidden_woods", 5);
+    let topic = cosmos_net::topic_for("demo", "chat");
     let _a_sub = a.subscribe(&topic);
     let mut sub = Box::pin(b.subscribe(&topic));
     a.connect(b.peer_id()).await.unwrap();
@@ -464,7 +464,7 @@ async fn peer_cache_reconnects_after_restart_without_bootstrap() {
     });
     let boot = server(&c).await;
     let key = Keypair::generate_ed25519();
-    let path = std::env::temp_dir().join(format!("bb-cache-{}.peers", PeerId::random()));
+    let path = std::env::temp_dir().join(format!("cosmos-cache-{}.peers", PeerId::random()));
     let a = Node::start(Config {
         keypair: Some(key.clone()),
         bootstrap: vec![boot],
@@ -599,7 +599,7 @@ async fn fallback_list_used_when_ipfs_disabled_or_failing() {
     let c = Node::start(base()).await.unwrap();
     let boot = server(&c).await;
     let url = serve_list(format!(
-        "# bb-p2p bootstrap list\n\n{boot}\n/ip4/127.0.0.1/tcp/9\n"
+        "# cosmos bootstrap list\n\n{boot}\n/ip4/127.0.0.1/tcp/9\n"
     ))
     .await;
     let dead: Multiaddr = format!("/ip4/127.0.0.1/tcp/1/p2p/{}", PeerId::random())
