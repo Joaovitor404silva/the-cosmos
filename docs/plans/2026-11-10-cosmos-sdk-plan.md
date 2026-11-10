@@ -8,10 +8,10 @@ Spec: `docs/specs/2026-11-10-cosmos-sdk-design.md`. Workflow: unit TDD per task 
 - [x] DHT-signaled hole punch (signed observed addresses + simultaneous dial) replaces relay-coordinated dcutr; `NO_PATH` error when nothing works.
 
 ## M1 — Sync plane over libp2p
-- [ ] `cosmos-core::Session`: host/join, ≤4 peers (5th rejected — test), membership events.
-- [ ] Channels: reliable-ordered + unreliable, per-channel caps (tests for order, loss tolerance, oversize drop).
-- [ ] Join codes via DHT session advert (signed; forged advert rejected — test).
-- [ ] Loopback 4-peer integration test: all pairs exchange 1k msgs.
+- [x] `cosmos-core::Session`: host/join, ≤4 peers (5th rejected — test), membership events.
+- [x] Channels: reliable-ordered + unreliable, per-channel caps (tests for order, loss tolerance, oversize drop).
+- [x] Join codes via DHT session advert (signed; forged advert rejected — test).
+- [x] Loopback 4-peer integration test: all pairs exchange 1k msgs.
 
 ## M2 — Path migration
 - [ ] Channel layer with sequence numbers independent of the path.
