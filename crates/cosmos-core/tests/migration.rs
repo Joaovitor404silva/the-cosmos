@@ -168,7 +168,12 @@ async fn flapping_direct_does_not_cause_a_switch_storm() {
     p.wait("migration to direct", |p| p.on("direct")).await;
     p.wait("all reliable messages", |p| p.ms.rel.len() >= i as usize).await;
     assert_eq!(p.ms.rel, (0..i).collect::<Vec<_>>());
+    // The switch event trails the path state; wait for it, then for extras.
+    p.wait("switch events", |p| !p.hs.switches.is_empty() && !p.ms.switches.is_empty()).await;
+    sleep(Duration::from_millis(300)).await;
+    p.drain();
     assert_eq!(p.hs.switches, vec![sw("relay", "direct")]);
+    assert_eq!(p.ms.switches, vec![sw("relay", "direct")]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
