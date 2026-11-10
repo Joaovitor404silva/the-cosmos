@@ -14,6 +14,7 @@ use tokio::time::{Instant, sleep, timeout};
 const SA: u64 = 76561198000000001;
 const SB: u64 = 76561198000000002;
 const SX: u64 = 76561198000000666;
+const SESSION: [u8; 32] = [9; 32];
 
 fn tcfg() -> SteamTransportConfig {
     SteamTransportConfig {
@@ -37,6 +38,7 @@ impl Node {
 fn node(net: &Arc<FakeSteamNet>, steam: u64, dir: &Arc<StaticDirectory>) -> Node {
     let key = Keypair::generate_ed25519();
     let t = SteamTransport::new(net.backend(steam), key.clone(), dir.clone(), tcfg());
+    t.set_session_key(SESSION);
     Node { key, t }
 }
 
@@ -206,7 +208,9 @@ async fn pathset_migrates_off_steam_and_falls_back() {
         let key = Keypair::generate_ed25519();
         let id = key.public().to_peer_id();
         let d: Arc<dyn Transport> = direct.transport_as(id);
-        let s: Arc<dyn Transport> = SteamTransport::new(steam.backend(sid), key, dir.clone(), tcfg());
+        let st = SteamTransport::new(steam.backend(sid), key, dir.clone(), tcfg());
+        st.set_session_key(SESSION);
+        let s: Arc<dyn Transport> = st;
         dir.insert(id, sid);
         (id, PathSet::new(vec![("direct".into(), d), ("steam".into(), s)], pcfg()).unwrap())
     };
@@ -356,4 +360,47 @@ async fn stranger_hellos_cannot_block_our_connects() {
     sleep(Duration::from_millis(100)).await;
     dir.insert(b.id(), SB);
     a.t.connect(b.id(), vec![]).await.expect("strangers starved our handshake");
+}
+
+/// Audit finding 3: a stranger messaging our SteamID must not learn our
+/// Cosmos key (PeerId -> DHT addr record -> IP). Only hellos tagged with the
+/// session key, or from SteamIDs we asked for, get a proof.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn strangers_get_no_proof() {
+    let net = FakeSteamNet::new();
+    let dir = Arc::new(StaticDirectory::default());
+    let a = node(&net, SA, &dir);
+    let x: Arc<FakeSteam> = net.backend(SX);
+    let replies = |n: &bind::Nonce| {
+        let x = x.clone();
+        let n = *n;
+        async move {
+            let mut proofs = vec![];
+            let end = Instant::now() + Duration::from_millis(300);
+            while Instant::now() < end {
+                let mut evs = vec![];
+                x.poll(&mut evs);
+                for e in evs {
+                    if let SteamEvent::Message { data, .. } = e
+                        && let Some(p) = bind::verify_proof(&data, SA, SX, &n)
+                    {
+                        proofs.push(p);
+                    }
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+            proofs
+        }
+    };
+    // Untagged, and tagged with another session's key: silence.
+    let n = bind::new_nonce();
+    x.send(SA, &bind::hello(&n), true).unwrap();
+    assert!(replies(&n).await.is_empty(), "stranger got our key");
+    let n = bind::new_nonce();
+    x.send(SA, &bind::hello_tagged(bind::HELLO, &n, Some(&[1; 32]), SX, SA), true).unwrap();
+    assert!(replies(&n).await.is_empty(), "wrong session key got our key");
+    // A member (same session key) gets the proof.
+    let n = bind::new_nonce();
+    x.send(SA, &bind::hello_tagged(bind::HELLO, &n, Some(&SESSION), SX, SA), true).unwrap();
+    assert_eq!(replies(&n).await, vec![a.id()]);
 }

@@ -105,8 +105,8 @@ async fn four_peers_join_by_code_and_exchange_1k_in_order() {
     let host_advert = code::pick(&host_node.find(&code::topic(NS, &adv.code)).await.unwrap(), NS, &adv.code, now())
         .expect("host advert visible");
     let forged = Advert { host: host_node.peer_id(), addrs: fifth.listen_addrs().await, salt: host_advert.salt };
-    let topic = code::topic(NS, &adv.code);
-    retry("forge", || fifth.publish(&topic, forged.encode(NS))).await;
+    let keys = code::keys(NS, &adv.code);
+    retry("forge", || fifth.publish(&keys.topic, forged.seal(NS, &keys))).await;
 
     let mut members = vec![];
     for n in &nodes {

@@ -13,7 +13,7 @@ use cosmos_core::{
     Transport,
 };
 use cosmos_net::{Config, Keypair, Multiaddr, Node};
-use cosmos_steam::{DhtDirectory, SteamApi, SteamConfig};
+use cosmos_steam::{DhtDirectory, SteamApi, SteamConfig, SteamTransport};
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString, c_char, c_void};
@@ -122,7 +122,8 @@ pub struct CosmosConfig {
     /// Absolute path of steam_api64.dll. NULL: the one next to the exe.
     pub steam_dll: *const c_char,
     /// AppID for our own Steam init (ignored when the game already runs
-    /// Steam). 0: 480.
+    /// Steam). Required in release builds when `steam` is on (init fails
+    /// with E_INVALID on 0); debug builds fall back to 480 (Spacewar).
     pub steam_app_id: u32,
     /// Events kept before the oldest are dropped. 0: 1024.
     pub event_queue: u32,
@@ -538,6 +539,13 @@ struct State {
     next_sub: AtomicU32,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     steam: Option<Arc<SteamApi>>,
+    steam_link: Option<SteamLink>,
+}
+
+/// The Steam path's pieces that need the join code's session key.
+struct SteamLink {
+    transport: Arc<SteamTransport>,
+    dir: Arc<DhtDirectory>,
 }
 
 /// Opaque instance handle.
@@ -557,11 +565,38 @@ fn load_key(path: Option<String>) -> Result<Keypair, Fail> {
             if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
                 std::fs::create_dir_all(dir).map_err(|e| fail(COSMOS_E_IO, format!("key dir: {e}")))?;
             }
-            std::fs::write(&path, b).map_err(|e| fail(COSMOS_E_IO, format!("key file: {e}")))?;
-            Ok(k)
+            match write_new_key(&path, &b) {
+                Ok(()) => Ok(k),
+                // Another instance created it first: use theirs.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => load_key(Some(path.to_string_lossy().into())),
+                Err(e) => Err(fail(COSMOS_E_IO, format!("key file: {e}"))),
+            }
         }
         Err(e) => Err(fail(COSMOS_E_IO, format!("key file: {e}"))),
     }
+}
+
+/// Create `path` holding `bytes`, all or nothing: written and synced to an
+/// owner-only temp file, then hard-linked into place (fails with
+/// `AlreadyExists` instead of replacing a key another instance just made).
+fn write_new_key(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut rnd = [0u8; 8];
+    getrandom::fill(&mut rnd).map_err(std::io::Error::other)?;
+    let tmp = path.with_extension(format!("tmp{}", u64::from_le_bytes(rnd)));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    let r = (|| {
+        let mut f = opts.open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::hard_link(&tmp, path)
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    r
 }
 
 fn listen_addrs(ip: &str) -> Result<Vec<Multiaddr>, Fail> {
@@ -617,25 +652,24 @@ unsafe fn init(cfg: *const CosmosConfig) -> Result<Box<Cosmos>, Fail> {
     }
 
     let _g = rt.enter();
-    let mut tasks = vec![];
+    let tasks = vec![];
     let direct = NetTransport::new(node.clone()).map_err(|e| fail(COSMOS_E_NET, e))?;
     let mut paths: Vec<(String, Arc<dyn Transport>)> = vec![("direct".into(), direct)];
     let mut steam = None;
+    let mut steam_link = None;
     if cfg.steam != 0 {
         let dll = steam_dll.or_else(|| Some(std::env::current_exe().ok()?.parent()?.join(cosmos_steam::DLL_NAME)));
-        let scfg = SteamConfig { app_id: if cfg.steam_app_id == 0 { 480 } else { cfg.steam_app_id }, dll };
-        let dir = Arc::new(DhtDirectory { node: node.clone() });
-        if let Some((name, t, api)) = cosmos_steam::steam_path(&scfg, key.clone(), dir) {
-            paths.push((name, t));
-            let (n, a) = (node.clone(), api.clone());
-            tasks.push(tokio::spawn(async move {
-                loop {
-                    if let Err(e) = cosmos_steam::publish_steam_id(&n, a.steam_id(), a.app_id()).await {
-                        tracing::debug!("steam id publish: {e:#}");
-                    }
-                    tokio::time::sleep(STEAM_REPUBLISH).await;
-                }
-            }));
+        // Release builds must name their own AppID (480 is Valve's test app).
+        let app_id = match cfg.steam_app_id {
+            0 if cfg!(debug_assertions) => 480,
+            0 => return Err(fail(COSMOS_E_INVALID, "steam_app_id is required when steam is on")),
+            id => id,
+        };
+        let scfg = SteamConfig { app_id, dll };
+        let dir = Arc::new(DhtDirectory::new(node.clone()));
+        if let Some((name, t, api)) = cosmos_steam::steam_path(&scfg, key.clone(), dir.clone()) {
+            paths.push((name, t.clone() as Arc<dyn Transport>));
+            steam_link = Some(SteamLink { transport: t, dir });
             steam = Some(api);
         }
     }
@@ -670,6 +704,7 @@ unsafe fn init(cfg: *const CosmosConfig) -> Result<Box<Cosmos>, Fail> {
         next_sub: AtomicU32::new(1),
         tasks: Mutex::new(tasks),
         steam,
+        steam_link,
     };
     drop(_g);
     Ok(Box::new(Cosmos { st, rt }))
@@ -714,6 +749,28 @@ impl Cosmos {
         lock(&self.st.tasks).push(pump);
     }
 
+    /// The code's session key is known: hand it to the paths that use it.
+    fn session_key(&self, key: [u8; 32]) {
+        let (Some(link), Some(api)) = (&self.st.steam_link, &self.st.steam) else { return };
+        link.transport.set_session_key(key);
+        link.dir.set_key(key);
+        // Our SteamID, readable only by session members.
+        let (n, steam) = (self.st.node.clone(), api.steam_id());
+        let task = self.rt.spawn(async move {
+            loop {
+                let wait = match cosmos_steam::publish_steam_id(&n, &key, steam).await {
+                    Ok(()) => STEAM_REPUBLISH,
+                    Err(e) => {
+                        tracing::debug!("steam id publish: {e:#}");
+                        Duration::from_secs(5)
+                    }
+                };
+                tokio::time::sleep(wait).await;
+            }
+        });
+        lock(&self.st.tasks).push(task);
+    }
+
     /// Claim the handle's one host/join, or `E_STATE`.
     fn begin(&self) -> Result<(), Fail> {
         if self.st.starting.swap(true, Ordering::AcqRel) || lock(&self.st.transport).is_none() {
@@ -740,6 +797,7 @@ impl Cosmos {
             code::advertise(&st.node, &st.ns, addrs).await
         });
         let adv = adv.map_err(|e| fail(COSMOS_E_NET, format!("advertise: {e:#}")))?;
+        self.session_key(adv.session);
         let t = self.take_transport()?;
         let cfg = SessionConfig { join_secret: Some(adv.secret), ..SessionConfig::default() };
         let s = self.rt.block_on(Session::host(t, cfg)).map_err(join_err)?;
@@ -762,9 +820,14 @@ impl Cosmos {
     fn join_inner(&self, code: String) -> Result<(), Fail> {
         let st = &self.st;
         let start = Instant::now();
+        let (ns, c) = (st.ns.clone(), code.clone());
+        let keys = self
+            .rt
+            .block_on(async { tokio::task::spawn_blocking(move || code::keys(&ns, &c)).await })
+            .map_err(|e| fail(COSMOS_E_PANIC, e))?;
         let advert = self.rt.block_on(async {
             loop {
-                match code::resolve(&st.node, &st.ns, &code).await {
+                match code::resolve_with(&st.node, &st.ns, &code, &keys).await {
                     Ok(a) => return Ok(a),
                     Err(e @ (CodeError::NotFound | CodeError::Net(_))) => {
                         if start.elapsed() > JOIN_TIMEOUT {
@@ -778,13 +841,9 @@ impl Cosmos {
                 }
             }
         })?;
-        let (ns, c) = (st.ns.clone(), code.clone());
-        let secret = self
-            .rt
-            .block_on(async { tokio::task::spawn_blocking(move || code::join_secret(&ns, &c)).await })
-            .map_err(|e| fail(COSMOS_E_PANIC, e))?;
+        self.session_key(keys.session);
         let t = self.take_transport()?;
-        let cfg = SessionConfig { join_secret: Some(secret), join_timeout: JOIN_TIMEOUT, ..SessionConfig::default() };
+        let cfg = SessionConfig { join_secret: Some(keys.secret), join_timeout: JOIN_TIMEOUT, ..SessionConfig::default() };
         let s = self.rt.block_on(Session::join(t, cfg, advert.host, advert.addrs)).map_err(join_err)?;
         self.start_session(s);
         Ok(())

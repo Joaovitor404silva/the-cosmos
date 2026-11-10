@@ -92,8 +92,9 @@ impl Default for Config {
                 "/ip6/::/tcp/0".parse().unwrap(),
             ],
             bootstrap: vec![],
-            mdns: true,
-            upnp: true,
+            // LAN discovery and UPnP expose us on the local network: opt in.
+            mdns: false,
+            upnp: false,
             hole_punch: true,
             tunnel_target: None,
             tunnel_allowlist: None,
@@ -273,6 +274,11 @@ enum Command {
         reply: Reply<()>,
     },
     Dial {
+        addr: Multiaddr,
+        reply: Reply<()>,
+    },
+    /// `Dial`, but only addresses in a scope we may reach (see `hint_allowed`).
+    DialHint {
         addr: Multiaddr,
         reply: Reply<()>,
     },
@@ -664,6 +670,46 @@ fn addr_scope(a: &Multiaddr) -> Scope {
         }
     }
     Scope::Public
+}
+
+fn advertised_from<'a>(
+    external: impl Iterator<Item = &'a Multiaddr>,
+    listeners: impl Iterator<Item = &'a Multiaddr>,
+    local_only: bool,
+    lan: bool,
+) -> Vec<Multiaddr> {
+    let tagged = external.map(|a| (a, true)).chain(listeners.map(|a| (a, false)));
+    let mut out: Vec<Multiaddr> = Vec::new();
+    for (a, confirmed) in tagged {
+        let a = split_peer(a).map(|(_, b)| b).unwrap_or_else(|| a.clone());
+        if is_unspecified(&a) || is_dns(&a) {
+            continue;
+        }
+        let scope = addr_scope(&a);
+        if !local_only && (scope == Scope::Loopback || (is_ip6(&a) && scope != Scope::Public)) {
+            continue;
+        }
+        if !local_only && !confirmed && !lan && scope == Scope::Private {
+            continue;
+        }
+        if !out.contains(&a) {
+            out.push(a);
+        }
+    }
+    out.sort_by_key(|a| !is_quic(a));
+    out.truncate(punch::MAX_ADDRS);
+    out
+}
+
+fn hint_allowed(addr: &Multiaddr, local_only: bool, lan: bool) -> bool {
+    if is_dns(addr) {
+        return false;
+    }
+    match addr_scope(addr) {
+        Scope::Public => true,
+        Scope::Private => lan || local_only,
+        Scope::Loopback => local_only,
+    }
 }
 
 fn kad_addr_allowed(addr: &Multiaddr, via: Option<&Multiaddr>, mdns_peer: bool) -> bool {
@@ -1227,6 +1273,12 @@ impl Node {
         })
     }
 
+    /// The addresses we share with peers (session adverts, address records):
+    /// see `advertised_from` for what is left out.
+    pub async fn advertised_addrs(&self) -> Vec<Multiaddr> {
+        self.ask(|reply| Command::Advertised { reply }).await
+    }
+
     pub async fn listen_addrs(&self) -> Vec<Multiaddr> {
         let me = self.peer_id;
         self.ask(|reply| Command::ListenAddrs { reply })
@@ -1248,6 +1300,14 @@ impl Node {
 
     pub fn add_external_addr(&self, addr: Multiaddr) {
         let _ = self.cmd.send(Command::AddExternal { addr });
+    }
+
+    /// Dial an address someone else handed us (a peer's advert or a session
+    /// member list): private-range addresses only with LAN discovery on,
+    /// loopback only on a loopback-only node, so a peer can't aim our dials
+    /// at our LAN or at third parties' private hosts.
+    pub async fn dial_hint(&self, addr: Multiaddr) -> anyhow::Result<()> {
+        self.call(|reply| Command::DialHint { addr, reply }).await
     }
 
     pub async fn dial(&self, addr: Multiaddr) -> anyhow::Result<()> {
@@ -1809,6 +1869,13 @@ impl EventLoop {
                 let _ = reply.send(t);
             }
             Command::Connect { peer, reply } => self.connect_peer(peer, Some(reply)),
+            Command::DialHint { addr, reply } => {
+                if hint_allowed(&addr, self.local_only(), self.cfg.mdns) {
+                    self.on_command(Command::Dial { addr, reply });
+                } else {
+                    let _ = reply.send(Err(anyhow!("address scope not allowed: {addr}")));
+                }
+            }
             Command::Dial { addr, reply } => {
                 if let Some((peer, base)) = split_peer(&addr) {
                     self.swarm.behaviour_mut().kad.add_address(&peer, base);
@@ -2364,33 +2431,17 @@ impl EventLoop {
     }
 
     /// Addresses we tell other peers to reach us on, QUIC first.
+    ///
+    /// Privacy: interface addresses on private ranges (LAN, VPN, CGNAT) are
+    /// only shared with LAN discovery on; confirmed external addresses
+    /// (observed, UPnP, or set by the app) always are.
     fn advertised(&self) -> Vec<Multiaddr> {
-        let local_only = self.local_only();
-        let all: Vec<Multiaddr> = self
-            .swarm
-            .external_addresses()
-            .chain(self.ipfs_observed.iter())
-            .chain(self.swarm.listeners())
-            .cloned()
-            .collect();
-        let mut out: Vec<Multiaddr> = Vec::new();
-        for a in all {
-            let a = split_peer(&a).map(|(_, b)| b).unwrap_or(a);
-            if is_unspecified(&a) || is_dns(&a) {
-                continue;
-            }
-            let scope = addr_scope(&a);
-            if !local_only && (scope == Scope::Loopback || (is_ip6(&a) && scope != Scope::Public))
-            {
-                continue;
-            }
-            if !out.contains(&a) {
-                out.push(a);
-            }
-        }
-        out.sort_by_key(|a| !is_quic(a));
-        out.truncate(punch::MAX_ADDRS);
-        out
+        advertised_from(
+            self.swarm.external_addresses().chain(self.ipfs_observed.iter()),
+            self.swarm.listeners(),
+            self.local_only(),
+            self.cfg.mdns,
+        )
     }
 
     /// Keep our signed address record fresh in the DHT.
@@ -3932,6 +3983,44 @@ mod tests {
         assert!(is_public_addr(&ma("/ip4/8.8.8.8/tcp/4001")));
         assert!(!is_public_addr(&ma("/ip4/192.168.1.2/tcp/4001")));
         assert!(!is_public_addr(&ma("/ip4/203.0.113.1/tcp/4001")));
+    }
+
+    /// Audit finding 5: hints from peers can't aim our dials at private or
+    /// loopback hosts unless we run on the LAN / loopback ourselves.
+    #[test]
+    fn dial_hints_are_scope_filtered() {
+        let (lan, lo, publ) = (ma("/ip4/192.168.1.9/tcp/80"), ma("/ip4/127.0.0.1/tcp/22"), ma("/ip4/8.8.8.8/tcp/4001"));
+        assert!(hint_allowed(&publ, false, false));
+        assert!(!hint_allowed(&lan, false, false));
+        assert!(!hint_allowed(&lo, false, false));
+        assert!(!hint_allowed(&lo, false, true));
+        assert!(hint_allowed(&lan, false, true));
+        assert!(hint_allowed(&lo, true, false));
+        assert!(!hint_allowed(&ma("/dns4/example.com/tcp/80"), false, true));
+    }
+
+    /// Audit finding 4: LAN/VPN/CGNAT interface addresses and non-global
+    /// IPv6 stay private unless LAN discovery is on.
+    #[test]
+    fn advertised_hides_private_interfaces_without_lan() {
+        let listeners = [
+            ma("/ip4/192.168.1.2/udp/4001/quic-v1"),
+            ma("/ip4/100.101.102.103/tcp/4001"),
+            ma("/ip4/127.0.0.1/tcp/4001"),
+            ma("/ip6/fd00::1/tcp/4001"),
+            ma("/ip4/8.8.8.8/tcp/4001"),
+        ];
+        let external = [ma("/ip4/9.9.9.9/udp/4001/quic-v1"), ma("/ip4/10.0.0.5/tcp/4002")];
+        let off = advertised_from(external.iter(), listeners.iter(), false, false);
+        assert_eq!(off, vec![ma("/ip4/9.9.9.9/udp/4001/quic-v1"), ma("/ip4/10.0.0.5/tcp/4002"), ma("/ip4/8.8.8.8/tcp/4001")]);
+        let on = advertised_from(external.iter(), listeners.iter(), false, true);
+        assert!(on.contains(&ma("/ip4/192.168.1.2/udp/4001/quic-v1")));
+        assert!(on.contains(&ma("/ip4/100.101.102.103/tcp/4001")));
+        assert!(!on.contains(&ma("/ip4/127.0.0.1/tcp/4001")));
+        assert!(!on.contains(&ma("/ip6/fd00::1/tcp/4001")));
+        // Loopback-only nodes (tests) keep their loopback listeners.
+        let lo = [ma("/ip4/127.0.0.1/tcp/4001")];
+        assert_eq!(advertised_from([].iter(), lo.iter(), true, false), lo.to_vec());
     }
 
     #[test]

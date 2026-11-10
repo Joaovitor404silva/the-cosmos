@@ -4,7 +4,7 @@ Date: 2026-11-10. Status: draft for user review.
 
 ## Goal
 
-A serverless online SDK that any game with **2–4 players** can plug into: no hosted game server, no matchmaking server. Generalizes bb-node (Bloodborne, now a game port) into a reusable library.
+A serverless online SDK that any game with **2–4 players** can plug into: no hosted game server, no matchmaking server. A reusable library generalized from an earlier single-game peer-to-peer node.
 
 Non-goals: MMO or >4 players, anti-cheat, dedicated servers, ranked matchmaking.
 
@@ -30,11 +30,12 @@ While on the Steam relay, the SDK keeps retrying direct in the background and mi
 
 ### Steam backend details
 - Uses `ISteamNetworkingMessages` (SDR) and Steam lobbies for invites/signaling.
-- The SDK ships its own `steam_api64.dll` (Steamworks redistributable) and inits with AppID 480 (Spacewar) when the game isn't a Steam game or has no Steam API — emulated games, non-Steam builds, Bloodborne on shadPS4/PC port. AppID is configurable.
+- The SDK ships its own `steam_api64.dll` (Steamworks redistributable) and inits Steam itself when the game isn't a Steam game or has no Steam API (emulated games, non-Steam builds). Release builds must set an AppID; debug builds fall back to 480 (Spacewar).
 - If the game already initialized Steam in-process, reuse its instance and AppID instead of a second init.
 - The daemon (`cosmos-node`) can own the Steam connection out of process, so games that must not load Steam still get the relay.
 - Loaded dynamically: if the Steam client isn't running, the SDK still works (direct/punch only).
 - Peer identity stays the Cosmos key; the SteamID is bound to it by a signed handshake message, never trusted alone.
+- Privacy: SteamIDs are shared only with session members (DHT record encrypted with the join code's session key). A `HELLO` gets a proof (which reveals our Cosmos key) only when tagged with that key or sent by a SteamID we contacted; strangers get silence.
 
 ## Architecture (Rust workspace)
 
@@ -64,7 +65,7 @@ void       cosmos_shutdown(cosmos_t*);
 ## Session model
 - Max 4 peers, enforced by the host and by connection limits.
 - Topology: full mesh between ≤4 peers (6 links max); host is authority for membership.
-- Join codes: short code → DHT key → host-signed session advert (addresses + Steam id if any). Steam lobby invite as an alternative when the Steam client is running.
+- Join codes: short code → Argon2id → DHT topic + join secret + AEAD key + session key. The host-signed advert body (host, addresses, secret salt) is encrypted, so DHT/gossip nodes can't read it or compute the code; the code binds the host key (forging needs ~2^40 Argon2id). Adverts carry only external addresses, plus LAN/VPN interface addresses when LAN mode is on. Steam lobby invite as an alternative when the Steam client is running.
 
 ## Security baseline (carried from bb-p2p audit)
 - Peer id = public key; all records signed; game namespace in every record key.
@@ -74,7 +75,7 @@ void       cosmos_shutdown(cosmos_t*);
 
 ## Testing
 - Unit TDD per crate; loopback 4-peer integration test (sync + async + forced Steam-relay (test double) → direct migration).
-- 2-PC test (two LAN PCs), cross-network test (a remote friend), Steam path test with two Steam accounts.
+- 2-PC LAN test, cross-network test (remote tester), Steam path test with two Steam accounts.
 - Proof: **Cosmos Depths** only — our own example game, shipped in the SDK (below). Tests with other games come after.
 
 ## Example game: Cosmos Depths
@@ -86,7 +87,7 @@ Part of the SDK (`examples/cosmos-depths`). Small original co-op roguelike in C 
 - Menu: host, or join by typing a code. Steam is on when `steam_api64.dll` is next to the exe. Flags for scripted runs; `--selftest` runs 1 host + 3 joiners (one late) + a fresh instance on loopback and exits 0/1.
 - Ships as a demo zip: exe + cosmos.dll + steam_api64.dll.
 
-## Repos
+## License
 - No GPL code.
 
 ## Open questions

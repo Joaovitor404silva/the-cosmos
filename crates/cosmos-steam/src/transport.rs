@@ -13,6 +13,10 @@
 //! - `connect` on a bound peer re-proves it, so `PathSet` reconnecting a dead
 //!   path never trusts a stale binding.
 //!
+//! Privacy: a proof reveals our Cosmos key (and so, via the DHT, our IP).
+//! We only answer a `HELLO` tagged with the session key (it holds the join
+//! code) or one from a SteamID we asked for ourselves; strangers get silence.
+//!
 //! Frames over one Steam message are split into pieces (reliable only).
 //! Strangers get at most half the handshake slots and a bounded number of
 //! bindings, and proofs are rate limited.
@@ -143,6 +147,8 @@ struct Shared {
     dir: Arc<dyn SteamDirectory>,
     cfg: SteamTransportConfig,
     state: Mutex<State>,
+    /// The join code's session key (see `set_session_key`).
+    session: Mutex<Option<[u8; 32]>>,
     bound: Notify,
     events: mpsc::Sender<TransportEvent>,
 }
@@ -176,6 +182,7 @@ impl SteamTransport {
             dir,
             cfg,
             state: Mutex::new(State::default()),
+            session: Mutex::new(None),
             bound: Notify::new(),
             events,
         });
@@ -190,6 +197,11 @@ impl SteamTransport {
 
     pub fn steam_id(&self) -> SteamId {
         self.shared.my_steam
+    }
+
+    /// The join code's session key: tags our hellos and admits members'.
+    pub fn set_session_key(&self, key: [u8; 32]) {
+        *self.shared.session.lock().unwrap() = Some(key);
     }
 
     /// The SteamID bound to `peer`, if the handshake completed.
@@ -252,7 +264,7 @@ impl SteamTransport {
                 p.nonce
             };
             s.backend.allow(steam);
-            match s.backend.send(steam, &bind::hello(&nonce), true) {
+            match s.backend.send(steam, &s.hello(HELLO, &nonce, steam), true) {
                 Ok(()) | Err(SendError::Full) => {}
                 Err(e) => tracing::debug!(steam, ?e, "steam hello failed"),
             }
@@ -272,6 +284,18 @@ impl SteamTransport {
 }
 
 impl Shared {
+    fn hello(&self, kind: u8, nonce: &Nonce, to: SteamId) -> Vec<u8> {
+        let key = *self.session.lock().unwrap();
+        bind::hello_tagged(kind, nonce, key.as_ref(), self.my_steam, to)
+    }
+
+    /// May `from` learn our key? It holds the session key, or we asked for it.
+    fn trusted(&self, st: &State, from: SteamId, hello: &[u8]) -> bool {
+        st.pending.get(&from).is_some_and(|p| p.outbound)
+            || st.by_steam.get(&from).is_some_and(|b| b.wanted)
+            || self.session.lock().unwrap().is_some_and(|k| bind::hello_tag_ok(hello, &k, from, self.my_steam))
+    }
+
     fn pump(self: Arc<Self>, stop: &AtomicBool) {
         let mut buf = Vec::new();
         let mut last_gc = Instant::now();
@@ -311,13 +335,16 @@ impl Shared {
                 let Some(nonce) = bind::parse_hello(&data) else { return };
                 let (back, sign) = {
                     let mut st = self.state.lock().unwrap();
+                    if !self.trusted(&st, from, &data) {
+                        return;
+                    }
                     // A HELLO (not a HELLO_BACK) is a reason to (re)check them:
                     // they may be new, or a new key on a bound SteamID.
                     let back = if kind == HELLO { st.pending_inbound(from, self.cfg.max_pending) } else { None };
                     (back, st.take_token(self.cfg.proofs_per_sec))
                 };
                 if let Some(n) = back {
-                    let _ = self.backend.send(from, &bind::hello_kind(HELLO_BACK, &n), true);
+                    let _ = self.backend.send(from, &self.hello(HELLO_BACK, &n, from), true);
                 }
                 if sign {
                     let _ = self.backend.send(from, &bind::proof(&self.key, self.my_steam, from, &nonce), true);
@@ -342,7 +369,7 @@ impl Shared {
             };
             drop(st);
             if let Some(n) = ask {
-                let _ = self.backend.send(from, &bind::hello(&n), true);
+                let _ = self.backend.send(from, &self.hello(HELLO, &n, from), true);
             }
             return;
         };

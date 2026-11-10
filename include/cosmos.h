@@ -227,7 +227,8 @@ typedef struct {
   const char *steam_dll;
   /**
    * AppID for our own Steam init (ignored when the game already runs
-   * Steam). 0: 480.
+   * Steam). Required in release builds when `steam` is on (init fails
+   * with E_INVALID on 0); debug builds fall back to 480 (Spacewar).
    */
   uint32_t steam_app_id;
   /**

@@ -33,10 +33,9 @@ pub mod transport;
 
 pub use backend::{FakeSteam, FakeSteamNet, MAX_MESSAGE, SendError, SteamBackend, SteamEvent, SteamId};
 pub use ffi::{DLL_ENV, DLL_NAME, SteamApi, SteamChannel, SteamConfig, Unavailable};
-pub use record::{DhtDirectory, STEAM_TOPIC, StaticDirectory, SteamDirectory, publish_steam_id};
+pub use record::{DhtDirectory, StaticDirectory, SteamDirectory, publish_steam_id};
 pub use transport::{MAX_FRAME, SteamTransport, SteamTransportConfig};
 
-use cosmos_core::Transport;
 use cosmos_net::Keypair;
 use std::sync::Arc;
 
@@ -52,11 +51,11 @@ pub fn steam_path(
     cfg: &SteamConfig,
     key: Keypair,
     dir: Arc<dyn SteamDirectory>,
-) -> Option<(String, Arc<dyn Transport>, Arc<SteamApi>)> {
+) -> Option<(String, Arc<SteamTransport>, Arc<SteamApi>)> {
     match SteamApi::load(cfg) {
         Ok(api) => {
             let t = SteamTransport::new(api.channel(COSMOS_CHANNEL), key, dir, SteamTransportConfig::default());
-            Some((PATH_NAME.to_string(), t as Arc<dyn Transport>, api))
+            Some((PATH_NAME.to_string(), t, api))
         }
         Err(e) => {
             tracing::info!("Steam relay path off: {e}");

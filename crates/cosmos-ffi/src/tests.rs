@@ -220,6 +220,24 @@ fn steam_on_without_steam_runs_direct_only() {
     unsafe { cosmos_shutdown(h) };
 }
 
+/// Audit finding 6: racing first starts agree on one key, and no temp or
+/// partial file is left behind.
+#[test]
+fn key_file_creation_is_atomic_and_race_free() {
+    let dir = std::env::temp_dir().join(format!("cosmos-ffi-keyrace-{}", std::process::id()));
+    let path = dir.join("id.key");
+    let ids: Vec<String> = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..8)
+            .map(|_| s.spawn(|| load_key(Some(path.to_string_lossy().into())).map(|k| k.public().to_peer_id().to_string())))
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap().unwrap_or_else(|e| panic!("{}", e.1))).collect()
+    });
+    assert!(ids.iter().all(|i| i == &ids[0]), "instances made different keys: {ids:?}");
+    let files: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(files, vec![std::ffi::OsString::from("id.key")], "temp files left");
+}
+
 #[test]
 fn key_file_keeps_the_identity() {
     let dir = std::env::temp_dir().join(format!("cosmos-ffi-key-{}", std::process::id()));

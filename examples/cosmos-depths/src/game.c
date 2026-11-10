@@ -75,6 +75,7 @@ void config_default(DepthsConfig *c) {
     memset(c, 0, sizeof *c);
     c->lan = 1;
     c->steam = -1;
+    c->app_id = 480; /* a demo: Valve's Spacewar test app (a real game sets its own) */
 }
 
 int config_set(DepthsConfig *c, const char *name, const char *value) {
