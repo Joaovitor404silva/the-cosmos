@@ -4,7 +4,8 @@ Spec: `docs/specs/2026-11-10-cosmos-sdk-design.md`. Workflow: unit TDD per task 
 
 ## M0 — Skeleton
 - [ ] Workspace `cosmos-net`, `cosmos-core`, `cosmos-steam`, `cosmos-ffi`, `cosmos-node`; CI-free `cargo test` green.
-- [ ] Copy (not move) bb-p2p `mesh` into `cosmos-net`; strip Bloodborne names; its existing tests pass.
+- [ ] Copy (not move) bb-p2p `mesh` into `cosmos-net`; strip Bloodborne names and the relay server/client + DEFAULT_RELAYS; remaining tests pass.
+- [ ] DHT-signaled hole punch (signed observed addresses + simultaneous dial) replaces relay-coordinated dcutr; `NO_PATH` error when nothing works.
 
 ## M1 — Sync plane over libp2p
 - [ ] `cosmos-core::Session`: host/join, ≤4 peers (5th rejected — test), membership events.
@@ -15,12 +16,12 @@ Spec: `docs/specs/2026-11-10-cosmos-sdk-design.md`. Workflow: unit TDD per task 
 ## M2 — Path migration
 - [ ] Channel layer with sequence numbers independent of the path.
 - [ ] Background direct retry while relayed; migrate on success, fall back on loss.
-- [ ] Test: start forced-relay, open direct, no lost/duplicated reliable messages across the switch; then kill direct → back to relay.
+- [ ] Test: start on a Steam-relay test double, open direct, no lost/duplicated reliable messages across the switch; then kill direct → back to Steam relay.
 
 ## M3 — Steam path
 - [ ] Dynamic load of `steam_api64.dll` (reuse in-process instance or init with AppID); absent Steam = feature off, no error.
 - [ ] Signaling over `ISteamNetworkingMessages`: exchange signed Cosmos addresses, bind SteamID ↔ Cosmos key.
-- [ ] SDR as a relay path in the ladder, ranked above Cosmos relay; dropped after direct is stable.
+- [ ] SDR as the only relay path; dropped after direct is stable.
 - [ ] Steam lobby invite → join code.
 - [ ] Live: two Steam accounts, two PCs (AppID 480), measure time-to-direct and fallback.
 

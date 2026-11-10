@@ -12,7 +12,7 @@ Non-goals: MMO or >4 players, anti-cheat, dedicated servers, ranked matchmaking.
 
 | Plane | Carries | Transport | Lag tolerance |
 |---|---|---|---|
-| **Sync** | live session traffic (positions, hits, RPCs) | direct peer links, relay fallback | low, real-time |
+| **Sync** | live session traffic (positions, hits, RPCs) | direct peer links, Steam relay fallback | low, real-time |
 | **Async** | anything that doesn't need to be in sync: messages, bloodstains/ghosts, lobby adverts, join codes, profiles, leaderboards-lite | Kademlia DHT + gossipsub, signed records | high, seconds is fine |
 
 Rule for adapters: if the game can live with it arriving late, it goes to the async plane. Lag there never hurts the session.
@@ -24,9 +24,9 @@ Per peer pair, tried in parallel, best path wins:
 1. LAN / IPv6 / UPnP direct.
 2. Hole punch (dcutr + port guessing, from bb-p2p `mesh`).
 3. **Steam relay (SDR)** — only if Steam is present. Used like Seamless Coop: Steam carries signaling and traffic **until** a direct path is up, then the session migrates to direct and drops Steam. If direct can't hold, it stays on (or falls back to) Steam.
-4. Cosmos relay (our Oracle VM / community relays) — last resort for non-Steam games.
+No Cosmos-hosted relay. Without Steam, if direct and punch both fail, the peers can't connect and the SDK reports it (`COSMOS_ERR_NO_PATH`). Hole punch signaling without a relay goes through the DHT: each peer publishes its signed observed addresses, then both dial at the same time.
 
-While on any relay, the SDK keeps retrying direct in the background and migrates without dropping the session (path migration under the channel layer; sequence numbers make the switch invisible to the game).
+While on the Steam relay, the SDK keeps retrying direct in the background and migrates without dropping the session (path migration under the channel layer; sequence numbers make the switch invisible to the game).
 
 ### Steam backend details
 - Uses `ISteamNetworkingMessages` (SDR) and Steam lobbies for invites/signaling.
@@ -38,7 +38,7 @@ While on any relay, the SDK keeps retrying direct in the background and migrates
 
 | Crate | Role | Source |
 |---|---|---|
-| `cosmos-net` | libp2p swarm, DHT, gossipsub, punch/relay ladder, path migration | lifted from bb-p2p `mesh` |
+| `cosmos-net` | libp2p swarm, DHT, gossipsub, direct/punch ladder, path migration | lifted from bb-p2p `mesh` |
 | `cosmos-steam` | optional Steam signaling + SDR relay path (feature `steam`) | new |
 | `cosmos-core` | identity keys, session (≤4 peers, host + members), channels (reliable ordered / unreliable), async record API with per-game namespaces, limits | new + bb-p2p `node` trust/limits |
 | `cosmos-ffi` | C ABI + generated `cosmos.h` (cbindgen); poll-based, no callbacks across threads | new |
@@ -66,12 +66,12 @@ void       cosmos_shutdown(cosmos_t*);
 
 ## Security baseline (carried from bb-p2p audit)
 - Peer id = public key; all records signed; game namespace in every record key.
-- Size and rate caps on every inbound path; connection limits; relay reservations limited.
+- Size and rate caps on every inbound path; connection limits.
 - Nothing from the network is passed raw to game memory; adapters validate.
 - Full security audit before any public release.
 
 ## Testing
-- Unit TDD per crate; loopback 4-peer integration test (sync + async + forced relay → direct migration).
+- Unit TDD per crate; loopback 4-peer integration test (sync + async + forced Steam-relay (test double) → direct migration).
 - 2-PC test (two LAN PCs), cross-network test (a remote friend), Steam path test with two Steam accounts.
 - Proof game: Bloodborne via a game port on the SDK, then one non-emulated Steam game.
 
