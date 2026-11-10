@@ -3,9 +3,9 @@
 Spec: `docs/specs/2026-11-10-cosmos-sdk-design.md`. Workflow: unit TDD per task (red test first), opus medium implements new pieces, one opus review per milestone, live tests run by the supervisor. Build with `CARGO_BUILD_JOBS=2`.
 
 ## M0 — Skeleton
-- [ ] Workspace `cosmos-net`, `cosmos-core`, `cosmos-steam`, `cosmos-ffi`; CI-free `cargo test` green.
-- [ ] Copy (not move) bb-p2p `mesh` into `cosmos-net`; strip Bloodborne names and the relay server/client + DEFAULT_RELAYS; remaining tests pass.
-- [ ] DHT-signaled hole punch (signed observed addresses + simultaneous dial) replaces relay-coordinated dcutr; `NO_PATH` error when nothing works.
+- [x] Workspace `cosmos-net`, `cosmos-core`, `cosmos-steam`, `cosmos-ffi`; CI-free `cargo test` green.
+- [x] Copy (not move) bb-p2p `mesh` into `cosmos-net`; strip Bloodborne names and the relay server/client + DEFAULT_RELAYS; remaining tests pass.
+- [x] DHT-signaled hole punch (signed observed addresses + simultaneous dial) replaces relay-coordinated dcutr; `NO_PATH` error when nothing works.
 
 ## M1 — Sync plane over libp2p
 - [ ] `cosmos-core::Session`: host/join, ≤4 peers (5th rejected — test), membership events.
