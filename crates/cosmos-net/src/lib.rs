@@ -9,7 +9,7 @@ mod store;
 mod tunnel;
 
 pub use discovery::{ConnLimits, ipfs_bootstrap, parse_list, provider_key};
-pub use libp2p::{Multiaddr, PeerId, identity::Keypair};
+pub use libp2p::{Multiaddr, PeerId, Stream as P2pStream, identity::Keypair};
 pub use portguess::Plan as PortGuessPlan;
 pub use punch::{ADDR_TOPIC, ConnectError, decode_addrs, encode_addrs, verify_addr_record};
 pub use record::{CLOCK_SKEW, MAX_TTL, Record};
@@ -217,6 +217,7 @@ struct Behaviour {
     pipe: pipe::Behaviour,
     rpc: pipe::Behaviour,
     rec: pipe::Behaviour,
+    sync: pipe::Behaviour,
 }
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(15);
@@ -224,6 +225,10 @@ const FIND_DEADLINE: Duration = Duration::from_secs(20);
 pub const MAX_FIND_PROVIDERS: usize = 32;
 const GOOD_MAX: usize = 4096;
 const REC_PROTO: StreamProtocol = StreamProtocol::new("/cosmos/rec/1.0.0");
+/// Session traffic (cosmos-core channels): one long-lived stream per direction.
+pub const SYNC_PROTO: StreamProtocol = StreamProtocol::new("/cosmos/sync/1.0.0");
+/// Inbound sync streams waiting for the session layer; extra ones are dropped.
+const SYNC_BACKLOG: usize = 64;
 const REC_MAX: usize = 320 << 10;
 const REC_TOPIC_MAX: usize = 1024;
 const REC_SERVE_MAX: usize = 16;
@@ -293,6 +298,10 @@ enum Command {
         reply: Reply<libp2p::Stream>,
     },
     OpenRec {
+        peer: PeerId,
+        reply: Reply<libp2p::Stream>,
+    },
+    OpenSync {
         peer: PeerId,
         reply: Reply<libp2p::Stream>,
     },
@@ -448,6 +457,7 @@ pub struct Node {
     own: Own,
     targets: tunnel::SharedTargets,
     rpc_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<RpcRequest>>>>,
+    sync_rx: Arc<Mutex<Option<mpsc::Receiver<(PeerId, libp2p::Stream)>>>>,
     gate: Arc<rpc::Gate>,
     blocked: PeerSet,
     permanently_blocked: HashSet<PeerId>,
@@ -702,6 +712,7 @@ fn build_swarm(cfg: &Config, keypair: Keypair, blocked: PeerSet) -> anyhow::Resu
                 pipe: pipe::Behaviour::new(tunnel::PROTOCOL),
                 rpc: pipe::Behaviour::new(rpc::PROTO),
                 rec: pipe::Behaviour::new(REC_PROTO),
+                sync: pipe::Behaviour::new(SYNC_PROTO),
             })
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(120)))
@@ -811,6 +822,7 @@ impl Node {
             peers: HashMap::new(),
         }));
         let (rpc_tx, rpc_rx) = mpsc::unbounded_channel();
+        let (sync_tx, sync_rx) = mpsc::channel(SYNC_BACKLOG);
         let gate = rpc::Gate::new(cfg.rpc.clone());
 
         let lp = EventLoop {
@@ -851,6 +863,7 @@ impl Node {
             inner_tx,
             note_tx,
             rpc_tx,
+            sync_tx,
             gate: gate.clone(),
             cache,
             cache_saved: now,
@@ -875,6 +888,7 @@ impl Node {
         tokio::spawn(lp.run(cmd_rx, inner_rx, note_rx));
 
         let rpc_rx = Arc::new(Mutex::new(Some(rpc_rx)));
+        let sync_rx = Arc::new(Mutex::new(Some(sync_rx)));
         Ok(Node {
             peer_id,
             keypair,
@@ -885,6 +899,7 @@ impl Node {
             own,
             targets,
             rpc_rx,
+            sync_rx,
             gate,
             blocked,
             permanently_blocked,
@@ -914,6 +929,17 @@ impl Node {
 
     pub fn rpc_requests(&self) -> Option<mpsc::UnboundedReceiver<RpcRequest>> {
         self.rpc_rx.lock().unwrap().take()
+    }
+
+    /// Open a session-traffic stream to `peer` (connecting first).
+    pub async fn open_sync_stream(&self, peer: PeerId) -> anyhow::Result<libp2p::Stream> {
+        self.connect(peer).await?;
+        self.call(|reply| Command::OpenSync { peer, reply }).await
+    }
+
+    /// Inbound session-traffic streams. Can be taken once.
+    pub fn sync_streams(&self) -> Option<mpsc::Receiver<(PeerId, libp2p::Stream)>> {
+        self.sync_rx.lock().unwrap().take()
     }
 
     pub async fn request(&self, peer: PeerId, data: Vec<u8>) -> anyhow::Result<Vec<u8>> {
@@ -1314,6 +1340,13 @@ impl Node {
     }
 }
 
+#[derive(Clone, Copy)]
+enum PipeKind {
+    Rpc,
+    Rec,
+    Sync,
+}
+
 struct EventLoop {
     swarm: Swarm<Behaviour>,
     cfg: Config,
@@ -1352,6 +1385,7 @@ struct EventLoop {
     inner_tx: mpsc::UnboundedSender<Inner>,
     note_tx: mpsc::UnboundedSender<tunnel::Note>,
     rpc_tx: mpsc::UnboundedSender<RpcRequest>,
+    sync_tx: mpsc::Sender<(PeerId, libp2p::Stream)>,
     gate: Arc<rpc::Gate>,
     cache: Option<discovery::PeerCache>,
     cache_saved: Instant,
@@ -1622,8 +1656,9 @@ impl EventLoop {
                     }
                 }
             }
-            Command::OpenRpc { peer, reply } => self.open_stream(peer, false, reply),
-            Command::OpenRec { peer, reply } => self.open_stream(peer, true, reply),
+            Command::OpenRpc { peer, reply } => self.open_stream(peer, PipeKind::Rpc, reply),
+            Command::OpenRec { peer, reply } => self.open_stream(peer, PipeKind::Rec, reply),
+            Command::OpenSync { peer, reply } => self.open_stream(peer, PipeKind::Sync, reply),
             Command::Get {
                 topic,
                 publisher,
@@ -1663,16 +1698,16 @@ impl EventLoop {
         }
     }
 
-    fn open_stream(&mut self, peer: PeerId, rec: bool, reply: Reply<libp2p::Stream>) {
+    fn open_stream(&mut self, peer: PeerId, kind: PipeKind, reply: Reply<libp2p::Stream>) {
         match self.best_conn(&peer) {
             Some((conn, _)) => {
                 let (tx, rx) =
                     futures::channel::oneshot::channel::<Result<libp2p::Stream, String>>();
                 let b = self.swarm.behaviour_mut();
-                if rec {
-                    b.rec.open(peer, conn, tx)
-                } else {
-                    b.rpc.open(peer, conn, tx)
+                match kind {
+                    PipeKind::Rpc => b.rpc.open(peer, conn, tx),
+                    PipeKind::Rec => b.rec.open(peer, conn, tx),
+                    PipeKind::Sync => b.sync.open(peer, conn, tx),
                 }
                 tokio::spawn(async move {
                     let r = match rx.await {
@@ -3338,6 +3373,11 @@ impl EventLoop {
                 }
             }
             BehaviourEvent::Rec(pipe::Inbound { peer, stream, .. }) => self.serve_rec(peer, stream),
+            BehaviourEvent::Sync(pipe::Inbound { peer, stream, .. }) => {
+                if self.sync_tx.try_send((peer, stream)).is_err() {
+                    tracing::debug!(%peer, "sync stream dropped: backlog full");
+                }
+            }
             BehaviourEvent::Mdns(mdns::Event::Discovered(list)) => {
                 for (p, a) in list {
                     self.mdns_peers.insert(p);
