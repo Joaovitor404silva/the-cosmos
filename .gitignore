@@ -1,3 +1,7 @@
 /target/
 # Steamworks redistributable (steam_api64.dll) for dev; see crates/cosmos-steam/src/lib.rs.
 /vendor/
+
+# Cosmos Depths: downloaded raylib (fetch-raylib.ps1) and build output.
+/examples/cosmos-depths/vendor/
+/dist/

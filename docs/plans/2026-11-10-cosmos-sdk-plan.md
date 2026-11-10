@@ -33,8 +33,8 @@ Spec: `docs/specs/2026-11-10-cosmos-sdk-design.md`. Workflow: unit TDD per task 
 - [x] `cosmos-ffi` poll API per spec; cbindgen `cosmos.h`; C example (`examples/chat.c`) with 4 instances. (`include/cosmos.h` checked in, `tests/header.rs` keeps it in sync; `tests/chat_c.rs` builds chat.c with MSVC and runs 4 instances in one process on loopback.)
 - [x] DLL builds for Windows x64; panic-safe boundary (test). (`cosmos.dll` + `cosmos.dll.lib` + static `cosmos.lib`; every export runs under `catch_unwind`, injected-panic test.)
 
-## M6 — Cosmos Demo (example game, ships in the SDK)
-- [ ] `examples/cosmos-demo`, C + raylib: arena + stars + join code (sync), notes + ghosts (async), path HUD.
+## M6 — Cosmos Depths (example game, ships in the SDK)
+- [x] `examples/cosmos-depths`, C + raylib co-op roguelike: seed + intents + host tick snapshots/events + prediction + late join (sync), notes + death marks by depth (async), path HUD, join code. (`tests/depths_c.rs` builds it with MSVC and runs `--selftest`: same map from the seed, predicted move, kill seen by all, late 4th joiner synced, note live by subscription and queried back by a fresh instance, death mark queried back; proof image `docs/img/cosmos-depths.png`.)
 - [ ] Live: 4 instances on 2 PCs, then cross-network with a remote friend; record a short showcase clip.
 
 ## M7 — Hardening

@@ -75,14 +75,15 @@ void       cosmos_shutdown(cosmos_t*);
 ## Testing
 - Unit TDD per crate; loopback 4-peer integration test (sync + async + forced Steam-relay (test double) → direct migration).
 - 2-PC test (two LAN PCs), cross-network test (a remote friend), Steam path test with two Steam accounts.
-- Proof: **Cosmos Demo** only — our own example game, shipped in the SDK (below). Tests with other games come after.
+- Proof: **Cosmos Depths** only — our own example game, shipped in the SDK (below). Tests with other games come after.
 
-## Example game: Cosmos Demo
-Part of the SDK (`examples/cosmos-demo`). Small original top-down 2D co-op game in C + raylib (zlib license), single window, uses only `cosmos.h`, so it proves the C API.
-- 1–4 players fly around a small arena and collect stars together (sync plane: positions unreliable, pickups reliable, host decides).
-- Players can leave short notes on the floor; other sessions see them later, and a faint ghost replay of past players (async plane, DHT records).
-- HUD shows the current path per peer (direct / punched / Steam relay) so migration is visible live.
-- Host shows a join code; join by typing it, or Steam invite.
+## Example game: Cosmos Depths
+Part of the SDK (`examples/cosmos-depths`). Small original co-op roguelike in C + raylib (zlib license), single window, ASCII glyphs, uses only `cosmos.h`, so it proves the C API and shows every mechanic of the network layer.
+- Play: 1–4 players go down a procedurally generated grid dungeon (rooms, corridors, simple monsters, a couple of potions, stairs). Bump to attack, simple HP; depth grows with the stairs.
+- Sync plane, host authoritative: the host sends the level seed reliably and everyone generates the same map; players send numbered move/attack intents reliably; the host runs monster AI and combat on a fixed real-time tick (6/s), broadcasts a compact state snapshot unreliably and events (kills, deaths, pickups, level change) reliably; clients predict their own move and replay unacknowledged intents over each snapshot. Joining and leaving mid-run work; a late joiner gets the seed plus the current state.
+- Async plane, DHT records under key `d<depth>` (room index + offset in the room, so a mark lands on any map of that depth): notes typed on a floor tile, and death marks (place + cause) shown as graves. Queried on every level enter and subscribed for live updates.
+- HUD shows the path per peer (direct / Steam relay, from `PATH_CHANGED`) and the join code on the host.
+- Menu: host, or join by typing a code. Steam is on when `steam_api64.dll` is next to the exe. Flags for scripted runs; `--selftest` runs 1 host + 3 joiners (one late) + a fresh instance on loopback and exits 0/1.
 - Ships as a demo zip: exe + cosmos.dll + steam_api64.dll.
 
 ## Repos
