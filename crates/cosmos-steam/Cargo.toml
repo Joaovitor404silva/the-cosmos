@@ -6,3 +6,16 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+cosmos-core = { path = "../cosmos-core" }
+cosmos-net = { path = "../cosmos-net" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+futures = "0.3"
+anyhow = "1"
+tracing = "0.1"
+getrandom = "0.3"
+libloading = "0.8"
+# Same version libp2p uses, for PublicKey decoding.
+libp2p-identity = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }

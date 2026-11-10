@@ -1,1 +1,3 @@
 /target/
+# Steamworks redistributable (steam_api64.dll) for dev; see crates/cosmos-steam/src/lib.rs.
+/vendor/
