@@ -19,10 +19,10 @@ Spec: `docs/specs/2026-11-10-cosmos-sdk-design.md`. Workflow: unit TDD per task 
 - [x] Test: start on a Steam-relay test double, open direct, no lost/duplicated reliable messages across the switch; then kill direct → back to Steam relay.
 
 ## M3 — Steam path
-- [ ] Dynamic load of bundled `steam_api64.dll`: reuse the game's in-process Steam if present, else init with AppID 480 (configurable). Steam client not running = path off, no error.
-- [ ] Signaling over `ISteamNetworkingMessages`: exchange signed Cosmos addresses, bind SteamID ↔ Cosmos key.
-- [ ] SDR as the only relay path; dropped after direct is stable.
-- [ ] Steam lobby invite → join code.
+- [x] Dynamic load of bundled `steam_api64.dll`: reuse the game's in-process Steam if present, else init with AppID 480 (configurable). Steam client not running = path off, no error. (Own init checked live on one PC; reuse-the-game's-Steam path not live-tested yet.)
+- [ ] Signaling over `ISteamNetworkingMessages`: exchange signed Cosmos addresses, bind SteamID ↔ Cosmos key. (Binding done: signed handshake + signed DHT SteamID record; address exchange over Steam not yet, addresses still come from the DHT.)
+- [x] SDR as the only relay path; dropped after direct is stable. (`SteamTransport` in `PathSet`, tested with a fake Steam.)
+- [ ] Steam lobby invite → join code. (Stub/TODO in `cosmos-steam`: needs ISteamMatchmaking + overlay callbacks.)
 - [ ] Live: two Steam accounts, two PCs (AppID 480), measure time-to-direct and fallback.
 
 ## M4 — Async plane
