@@ -74,6 +74,7 @@ struct MemInner {
     loss_pct: u64,
     rng: u64,
     cut: bool,
+    hole: bool,
 }
 
 impl MemInner {
@@ -129,6 +130,12 @@ impl MemNet {
         }
     }
 
+    /// Silently lose every frame while connects still succeed and no
+    /// `Down` is raised: a NAT mapping that expired under a live connection.
+    pub fn set_blackhole(&self, on: bool) {
+        self.inner.lock().unwrap().hole = on;
+    }
+
     /// Bring a `cut` network back.
     pub fn restore(&self) {
         self.inner.lock().unwrap().cut = false;
@@ -176,7 +183,7 @@ impl Transport for MemTransport {
         if !i.peers.contains_key(&self.me) {
             return Err(TransportError::Closed);
         }
-        if i.cut {
+        if i.cut || i.hole {
             return Ok(());
         }
         if !reliable && i.loss_pct > 0 && i.roll() < i.loss_pct {
