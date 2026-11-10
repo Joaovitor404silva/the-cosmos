@@ -97,8 +97,11 @@ async fn four_peers_join_by_code_and_exchange_1k_in_order() {
     let adv = retry("advertise", || code::advertise(&host_node, NS, addrs.clone())).await;
     let code = code::pretty(&adv.code);
 
-    // The 5th node also publishes a forged advert for the same code.
-    let forged = Advert { host: host_node.peer_id(), addrs: fifth.listen_addrs().await, salt: 1 };
+    // The 5th node also publishes a forged advert under the same topic: it
+    // copies the host id and real salt but points at its own addresses.
+    let host_advert = code::pick(&host_node.find(&code::topic(NS, &adv.code)).await.unwrap(), NS, &adv.code, now())
+        .expect("host advert visible");
+    let forged = Advert { host: host_node.peer_id(), addrs: fifth.listen_addrs().await, salt: host_advert.salt };
     let topic = code::topic(NS, &adv.code);
     retry("forge", || fifth.publish(&topic, forged.encode(NS))).await;
 
@@ -106,6 +109,7 @@ async fn four_peers_join_by_code_and_exchange_1k_in_order() {
     for n in &nodes {
         let found = retry("resolve", || code::resolve(n, NS, &code)).await;
         assert_eq!(found.host, host_node.peer_id(), "resolved to a forged advert");
+        assert_eq!(found.addrs, addrs, "resolved to forged addresses");
         let s = Session::join(transport(n, &cfg), cfg.clone(), found.host, found.addrs)
             .await
             .expect("join");
@@ -178,4 +182,11 @@ async fn exchange(mut s: Session) {
         let u = unrel.get(p).expect("no unreliable at all");
         assert!(u.windows(2).all(|w| w[0] < w[1]), "unreliable out of order");
     }
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
