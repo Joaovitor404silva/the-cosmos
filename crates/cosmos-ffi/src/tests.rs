@@ -62,6 +62,7 @@ struct Got {
     record_key: String,
     publisher: Vec<u8>,
     count: u32,
+    path: i32,
 }
 
 unsafe fn bytes(p: *const u8, n: usize) -> Vec<u8> {
@@ -93,6 +94,7 @@ fn poll(c: *mut Cosmos) -> Option<Got> {
             record_key: text(e.record_key),
             publisher: bytes(e.publisher, e.publisher_len),
             count: e.count,
+            path: e.path,
         })
     }
 }
@@ -254,6 +256,14 @@ fn host_join_send_and_records_over_loopback() {
     let ja = wait(a, 20, |g| g.kind == COSMOS_EV_PEER_JOINED);
     assert_eq!(peer_id(b, jb.peer), peer_id(a, 0), "b's handle names a");
     assert_eq!(peer_id(a, ja.peer), peer_id(b, 0), "a's handle names b");
+    assert_eq!(unsafe { cosmos_host_peer(b) }, jb.peer, "b's host is a");
+    assert_eq!(unsafe { cosmos_host_peer(a) }, 0, "a is the host");
+    assert_eq!(unsafe { cosmos_host_peer(null()) }, 0);
+    // Each side learns the first path right after the join.
+    for (h, p) in [(a, ja.peer), (b, jb.peer)] {
+        let e = wait(h, 5, |g| g.kind == COSMOS_EV_PATH_CHANGED);
+        assert_eq!((e.peer, e.path), (p, COSMOS_PATH_DIRECT));
+    }
 
     let msg = b"ping";
     let r = unsafe { cosmos_send(b, jb.peer, 3, msg.as_ptr().cast(), msg.len(), 1) };

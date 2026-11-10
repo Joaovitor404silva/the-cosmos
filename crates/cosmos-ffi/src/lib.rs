@@ -454,6 +454,8 @@ struct Peers {
 struct Shared {
     queue: Mutex<Queue>,
     peers: Mutex<Peers>,
+    /// For the first path of a newly joined peer.
+    paths: Arc<PathSet>,
 }
 
 impl Shared {
@@ -640,8 +642,8 @@ unsafe fn init(cfg: *const CosmosConfig) -> Result<Box<Cosmos>, Fail> {
     let built = PathSet::new(paths, PathConfig::default())
         .map_err(|e| fail(COSMOS_E_NET, e))
         .and_then(|t| Ok((t, Arc::new(Records::new(node.clone(), rcfg).map_err(record_err)?))));
-    let (transport, records): (Arc<dyn Transport>, _) = match built {
-        Ok((t, r)) => (t as Arc<dyn Transport>, r),
+    let (pathset, records) = match built {
+        Ok(v) => v,
         Err(e) => {
             if let Some(api) = &steam {
                 api.release();
@@ -657,8 +659,9 @@ unsafe fn init(cfg: *const CosmosConfig) -> Result<Box<Cosmos>, Fail> {
         shared: Arc::new(Shared {
             queue: Mutex::new(Queue { q: VecDeque::new(), cap, dropped: 0 }),
             peers: Mutex::new(Peers::default()),
+            paths: pathset.clone(),
         }),
-        transport: Mutex::new(Some(transport)),
+        transport: Mutex::new(Some(pathset as Arc<dyn Transport>)),
         session: Mutex::new(None),
         advert: Mutex::new(None),
         starting: std::sync::atomic::AtomicBool::new(false),
@@ -690,8 +693,18 @@ impl Cosmos {
         let shared = self.st.shared.clone();
         let pump = self.rt.spawn(async move {
             while let Some(e) = rx.recv().await {
+                let joined = match &e {
+                    SessionEvent::Joined(p) => Some(*p),
+                    _ => None,
+                };
                 let ev = shared.session_event(e);
                 shared.push(ev);
+                // PATH_CHANGED only fires on a switch: report the first path.
+                if let Some(p) = joined
+                    && let Some(name) = shared.paths.active_path(p)
+                {
+                    shared.push(Ev::Path { peer: shared.handle(p), path: path_kind(&name) });
+                }
             }
         });
         lock(&self.st.tasks).push(pump);
@@ -1005,6 +1018,20 @@ pub unsafe extern "C" fn cosmos_poll(c: *mut Cosmos, ev: *mut CosmosEvent) -> i3
                 *out = CosmosEvent::default();
                 Ok(0)
             }
+        }
+    })
+}
+
+/// Handle of the session host, 0 when we are the host or have no session.
+/// Only trust session control messages (level, state) from this peer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cosmos_host_peer(c: *const Cosmos) -> u32 {
+    guard(0, || {
+        let Some(c) = (unsafe { c.as_ref() }) else { return 0 };
+        let s = lock(&c.st.session).clone();
+        match s {
+            Some(s) if !s.is_host() => c.st.shared.handle(s.host_peer()),
+            _ => 0,
         }
     })
 }
