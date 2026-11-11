@@ -247,19 +247,21 @@ fn stale_key_temps_are_removed() {
     let old = dir.join("id.tmp111");
     let fresh = dir.join("id.tmp222");
     let other = dir.join("other.tmp333");
-    for p in [&old, &fresh, &other] {
+    let tmpl = dir.join("id.tmpl");
+    for p in [&old, &fresh, &other, &tmpl] {
         std::fs::write(p, b"x").unwrap();
     }
     let past = std::time::SystemTime::now() - Duration::from_secs(3600);
-    for p in [&old, &other] {
+    for p in [&old, &other, &tmpl] {
         std::fs::File::options().write(true).open(p).unwrap().set_modified(past).unwrap();
     }
     assert!(load_key(Some(dir.join("id.key").to_string_lossy().into())).is_ok());
-    let (o, f, x) = (old.exists(), fresh.exists(), other.exists());
+    let (o, f, x, l) = (old.exists(), fresh.exists(), other.exists(), tmpl.exists());
     std::fs::remove_dir_all(&dir).unwrap();
     assert!(!o, "stale temp kept");
     assert!(f, "fresh temp removed");
-    assert!(x, "unrelated file removed");
+    assert!(x && l, "unrelated file removed");
+
 }
 
 #[test]

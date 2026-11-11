@@ -561,9 +561,28 @@ pub struct Cosmos {
 
 fn load_key(path: Option<String>) -> Result<Keypair, Fail> {
     let Some(path) = path else { return Ok(Keypair::generate_ed25519()) };
-    let path = PathBuf::from(path);
+    load_key_from(PathBuf::from(path), 0)
+}
+
+/// Modified in the last few seconds.
+fn young(path: &std::path::Path) -> bool {
+    let age = std::fs::metadata(path).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
+    age.is_some_and(|a| a < Duration::from_secs(5))
+}
+
+fn load_key_from(path: PathBuf, tries: u32) -> Result<Keypair, Fail> {
     match std::fs::read(&path) {
-        Ok(b) => Keypair::from_protobuf_encoding(&b).map_err(|e| fail(COSMOS_E_INVALID, format!("key file: {e}"))),
+
+        Ok(b) => match Keypair::from_protobuf_encoding(&b) {
+            Ok(k) => Ok(k),
+            // Another instance may be writing it right now (no-hard-link
+            // fallback): give a young file a moment.
+            Err(_) if young(&path) && tries < 20 => {
+                std::thread::sleep(Duration::from_millis(50));
+                load_key_from(path, tries + 1)
+            }
+            Err(e) => Err(fail(COSMOS_E_INVALID, format!("key file: {e}"))),
+        },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             clean_stale_temps(&path);
             let k = Keypair::generate_ed25519();
@@ -574,7 +593,7 @@ fn load_key(path: Option<String>) -> Result<Keypair, Fail> {
             match write_new_key(&path, &b) {
                 Ok(()) => Ok(k),
                 // Another instance created it first: use theirs.
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => load_key(Some(path.to_string_lossy().into())),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => load_key_from(path, tries),
                 Err(e) => Err(fail(COSMOS_E_IO, format!("key file: {e}"))),
             }
         }
@@ -605,7 +624,11 @@ fn write_new_key(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     })();
     let _ = std::fs::remove_file(&tmp);
     match r {
-        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists && !path.exists() => {
+        // Another instance won the race in its own fallback.
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists && path.exists() => {
+            Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, e))
+        }
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => {
             tracing::debug!("key file hard link: {e}; writing in place");
             let mut f = opts.open(path)?;
             f.write_all(bytes).and_then(|()| f.sync_all()).inspect_err(|_| {
@@ -626,7 +649,11 @@ fn clean_stale_temps(path: &std::path::Path) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     for e in rd.flatten() {
         let old = e.metadata().ok().and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok());
-        if e.file_name().to_string_lossy().starts_with(&prefix) && old.is_some_and(|d| d > Duration::from_secs(60)) {
+        let name = e.file_name().to_string_lossy().into_owned();
+        // Exactly `<stem>.tmp<u64>`, the names write_new_key makes.
+        let ours = name.strip_prefix(&prefix).is_some_and(|n| !n.is_empty() && n.parse::<u64>().is_ok());
+        if ours && old.is_some_and(|d| d > Duration::from_secs(60)) {
+
             let _ = std::fs::remove_file(e.path());
         }
     }
@@ -816,6 +843,14 @@ impl Cosmos {
         lock(&self.st.tasks).push(task);
     }
 
+    /// Host/join failed after the session key went out: stop announcing it.
+    fn failed_start(&self, e: JoinError) -> Fail {
+        if let Some(t) = lock(&self.st.steam_pub).take() {
+            t.abort();
+        }
+        join_err(e)
+    }
+
     /// Claim the handle's one host/join, or `E_STATE`.
     fn begin(&self) -> Result<(), Fail> {
         if self.st.starting.swap(true, Ordering::AcqRel) || lock(&self.st.transport).is_none() {
@@ -845,7 +880,7 @@ impl Cosmos {
         self.session_key(adv.session);
         let t = self.take_transport()?;
         let cfg = SessionConfig { join_secret: Some(adv.secret), ..SessionConfig::default() };
-        let s = self.rt.block_on(Session::host(t, cfg)).map_err(join_err)?;
+        let s = self.rt.block_on(Session::host(t, cfg)).map_err(|e| self.failed_start(e))?;
         self.start_session(s);
         let code = code::pretty(&adv.code);
         *lock(&self.st.advert) = Some(adv);
@@ -865,7 +900,10 @@ impl Cosmos {
     fn join_inner(&self, code: String) -> Result<(), Fail> {
         let st = &self.st;
         let start = Instant::now();
-        let keys = self.rt.block_on(code::keys_today(&st.ns, &code)).map_err(|e| fail(COSMOS_E_INVALID, e))?;
+        let keys = self.rt.block_on(code::keys_today(&st.ns, &code)).map_err(|e| match e {
+            CodeError::BadCode => fail(COSMOS_E_INVALID, e),
+            e => fail(COSMOS_E_PANIC, e),
+        })?;
         let advert = self.rt.block_on(async {
             loop {
                 match code::resolve_with(&st.node, &st.ns, &code, &keys).await {
@@ -885,7 +923,7 @@ impl Cosmos {
         self.session_key(advert.session);
         let t = self.take_transport()?;
         let cfg = SessionConfig { join_secret: Some(advert.secret), join_timeout: JOIN_TIMEOUT, ..SessionConfig::default() };
-        let s = self.rt.block_on(Session::join(t, cfg, advert.host, advert.addrs)).map_err(join_err)?;
+        let s = self.rt.block_on(Session::join(t, cfg, advert.host, advert.addrs)).map_err(|e| self.failed_start(e))?;
         self.start_session(s);
         Ok(())
     }

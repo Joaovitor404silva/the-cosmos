@@ -13,8 +13,9 @@
 //!   clock is off by up to a day still finds it with one derivation.
 //! - The advert body (host, addrs, salt, join secret, session key) is
 //!   XChaCha20-Poly1305 encrypted. The join secret and session key are random
-//!   per session, so even breaking a day's topic table yields no secret that
-//!   outlives that advert.
+//!   per session, not a function of the code: reading them needs that
+//!   session's advert plus a ~2^40 Argon2id table for one of its three days.
+
 //! - Junk under a topic is rejected by the AEAD tag before any slow hash.
 //!   More distinct decryptable hosts than `MAX_CHECKED` is a conflict.
 //! - Two valid adverts naming different hosts make `resolve` fail instead

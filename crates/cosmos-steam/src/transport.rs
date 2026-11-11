@@ -6,8 +6,10 @@
 //! proved which Cosmos peer is behind it.
 //!
 //! Bindings heal themselves:
-//! - frames from a SteamID we were recently bound to make us ask it for a
-//!   proof (anyone else gets silence: no presence oracle);
+//! - frames from a SteamID we were recently bound to, asked for, or that
+//!   showed the session key make us ask it for a proof (anyone else gets
+//!   silence: no presence oracle);
+
 //! - a `HELLO` from a bound SteamID makes us re-check it, so a peer that
 //!   restarted with a new key on the same Steam account rebinds (the old
 //!   peer gets `Down`);
@@ -112,17 +114,24 @@ struct State {
 impl State {
     fn unbind(&mut self, steam: SteamId) -> Option<PeerId> {
         let b = self.by_steam.remove(&steam)?;
-        if self.known.len() >= MAX_KNOWN
-            && let Some(old) = self.known.iter().min_by_key(|(_, t)| **t).map(|(k, _)| *k)
-        {
-            self.known.remove(&old);
-        }
-        self.known.insert(steam, Instant::now());
+        self.remember(steam);
         if self.by_peer.get(&b.peer) == Some(&steam) {
             self.by_peer.remove(&b.peer);
         }
         self.asm.remove(&steam);
         Some(b.peer)
+    }
+
+    /// `steam` may re-ask for a proof for a while (we were bound to it, or
+    /// it showed the session key, or we asked for it).
+    fn remember(&mut self, steam: SteamId) {
+        if !self.known.contains_key(&steam)
+            && self.known.len() >= MAX_KNOWN
+            && let Some(old) = self.known.iter().min_by_key(|(_, t)| **t).map(|(k, _)| *k)
+        {
+            self.known.remove(&old);
+        }
+        self.known.insert(steam, Instant::now());
     }
 
     fn strangers_pending(&self) -> usize {
@@ -256,7 +265,9 @@ impl SteamTransport {
                     return Ok(peer);
                 }
                 let now = Instant::now();
+                st.remember(steam);
                 if !st.pending.contains_key(&steam) && st.pending.len() >= s.cfg.max_pending {
+
                     // Our own connects outrank strangers: evict the oldest one.
                     let old = st.pending.iter().filter(|(_, p)| !p.outbound).min_by_key(|(_, p)| p.since).map(|(k, _)| *k);
                     match old {
@@ -357,6 +368,7 @@ impl Shared {
                     if !self.trusted(&st, from, &data) {
                         return;
                     }
+                    st.remember(from);
                     // A HELLO (not a HELLO_BACK) is a reason to (re)check them:
                     // they may be new, or a new key on a bound SteamID.
                     let back = if kind == HELLO { st.pending_inbound(from, self.cfg.max_pending) } else { None };

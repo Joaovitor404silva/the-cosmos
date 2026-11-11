@@ -426,3 +426,30 @@ async fn stranger_data_gets_silence() {
         sleep(Duration::from_millis(5)).await;
     }
 }
+
+/// Review: a member whose handshake with us never finished (its proof
+/// dropped) still gets re-asked when its frames arrive later.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn half_finished_handshake_is_repaired() {
+    let net = FakeSteamNet::new();
+    let dir = Arc::new(StaticDirectory::default());
+    let _a = node(&net, SA, &dir);
+    let x: Arc<FakeSteam> = net.backend(SX);
+    let n = bind::new_nonce();
+    x.send(SA, &bind::hello_tagged(bind::HELLO, &n, Some(&SESSION), SX, SA), true).unwrap();
+    // X never answers; A's pending entry expires (2 x handshake timeout).
+    sleep(Duration::from_millis(3000)).await;
+    let mut evs = vec![];
+    x.poll(&mut evs);
+    x.send(SA, &[bind::DATA, 1, 2, 3], true).unwrap();
+    let end = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < end {
+        evs.clear();
+        x.poll(&mut evs);
+        if evs.iter().any(|e| matches!(e, SteamEvent::Message { data, .. } if data[0] == bind::HELLO)) {
+            return;
+        }
+        sleep(Duration::from_millis(5)).await;
+    }
+    panic!("A never re-asked a member it had started a handshake with");
+}
