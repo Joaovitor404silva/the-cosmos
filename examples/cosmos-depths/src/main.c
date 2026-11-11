@@ -273,7 +273,7 @@ int main(int argc, char **argv) {
         if (!strcmp(a, "--host")) host_now = 1;
         else if (!strcmp(a, "--public")) public_now = 1;
         else if (!strcmp(a, "--browse")) browse_now = 1;
-        else if (!strcmp(a, "--bot")) bot = 1;
+        else if (!strcmp(a, "--bot")) bot = cfg.test = 1;
         else if (!strcmp(a, "--join") && *v == '@') { snprintf(join_file, sizeof join_file, "%s", v + 1); i++; }
         else if (!strcmp(a, "--join") && *v) { snprintf(code, sizeof code, "%s", v); i++; }
         else if (!strcmp(a, "--window") && *v) { sscanf(v, "%d,%d", &wx, &wy); i++; }

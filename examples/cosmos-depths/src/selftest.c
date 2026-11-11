@@ -141,6 +141,7 @@ int selftest(void) {
     strcpy(cfg.listen, "127.0.0.1");
     cfg.lan = 0;
     cfg.steam = 0;
+    cfg.test = 1;
     for (int i = 0; i < N; i++) {
         g[i] = game_new(&cfg, err, sizeof err);
         if (!g[i]) { printf("FAIL init: %s\n", err); goto out; }

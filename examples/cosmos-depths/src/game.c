@@ -778,7 +778,7 @@ Game *game_new(const DepthsConfig *cfg, char *err, size_t cap) {
     g->marks_depth = -1;
 
     memset(&cc, 0, sizeof cc);
-    cc.game_id = GAME_ID;
+    cc.game_id = cfg->test ? GAME_ID_TEST : GAME_ID;
     cc.listen = cfg->listen[0] ? cfg->listen : NULL;
     cc.bootstrap = cfg->bootstrap[0] ? cfg->bootstrap : NULL;
     cc.key_path = cfg->key[0] ? cfg->key : NULL;

@@ -9,6 +9,7 @@
 #include "cosmos.h"
 
 #define GAME_ID "cosmos-depths"
+#define GAME_ID_TEST "cosmos-depths-test"
 #define MAP_W 60
 #define MAP_H 32
 #define MAX_ROOMS 10
@@ -80,6 +81,7 @@ typedef struct {
     int lan;
     int steam; /* -1: on if steam_api64.dll is next to the exe */
     uint32_t app_id;
+    int test; /* scripted/test runs: own namespace, never seen by real players */
 } DepthsConfig;
 
 typedef struct {
