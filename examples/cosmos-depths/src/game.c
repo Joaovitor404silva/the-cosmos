@@ -265,25 +265,28 @@ static void on_lobby(Game *g, const cosmos_event_t *ev) {
     Lobby *l = NULL;
     char code[COSMOS_CODE_MAX];
     size_t n = ev->len - 3;
-    if (n != 9) return; /* XXXX-XXXX */
+    int players = ev->data[0], depth = get_u16(ev->data + 1);
+    if (n != 9 || players < 1 || players > MAX_PLAYERS || depth < 1) return; /* XXXX-XXXX */
     for (size_t i = 0; i < n; i++) {
         char c = (char)ev->data[3 + i];
-        if (!(c == '-' || (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z'))) return;
+        if (i == 4 ? c != '-' : !strchr("0123456789ABCDEFGHJKMNPQRSTVWXYZ", c) || !c) return;
         code[i] = c;
     }
     code[n] = 0;
     for (int i = 0; i < g->n_lobbies && !l; i++)
         if (g->lobbies[i].pub_len == ev->publisher_len && !memcmp(g->lobbies[i].pub, ev->publisher, ev->publisher_len)) l = &g->lobbies[i];
     if (!l && g->n_lobbies < MAX_LOBBIES) l = &g->lobbies[g->n_lobbies++];
-    if (!l) { /* full: replace the stalest */
+    if (!l) { /* full: replace the stalest, but never a listing still being refreshed */
         l = &g->lobbies[0];
         for (int i = 1; i < MAX_LOBBIES; i++) if (g->lobbies[i].seen < l->seen) l = &g->lobbies[i];
+        if (g->now - l->seen < LOBBY_EVERY + 5) return;
     }
     memcpy(l->pub, ev->publisher, ev->publisher_len);
     l->pub_len = ev->publisher_len;
     copy_str(l->code, sizeof l->code, code);
-    l->players = ev->data[0];
-    l->depth = get_u16(ev->data + 1);
+    l->players = players;
+    l->depth = depth;
+
     l->seen = g->now;
 }
 
@@ -800,24 +803,40 @@ Game *game_new(const DepthsConfig *cfg, char *err, size_t cap) {
     return g;
 }
 
-/* A join or put can block for a while; when one is still running after a
- * short wait we leave the handle to process exit instead of freezing the
- * window (cosmos_shutdown must not run during another call). */
-void game_free(Game *g) {
-    double until;
-    if (!g) return;
-    g->quitting = 1;
-    until = plat_now() + 4; /* ghost/lobby puts are usually in flight */
+/* Wait for every worker, then close the node (cosmos_shutdown must not run
+ * during another call). */
+static int game_reap(void *arg) {
+    Game *g = arg;
     Job *jobs[] = {&g->net, &g->put, &g->ghost_put, &g->lobby_put};
-    for (size_t i = 0; i < sizeof jobs / sizeof jobs[0]; i++)
-        while (jobs[i]->thread && !plat_thread_done(jobs[i]->thread)) {
-            if (plat_now() > until) return;
-            plat_sleep(20);
-        }
-    for (size_t i = 0; i < sizeof jobs / sizeof jobs[0]; i++) plat_thread_join(jobs[i]->thread);
-
+    for (size_t i = 0; i < sizeof jobs / sizeof jobs[0]; i++) {
+        while (jobs[i]->thread && !plat_thread_done(jobs[i]->thread)) plat_sleep(20);
+        plat_thread_join(jobs[i]->thread);
+    }
     cosmos_shutdown(g->c);
     free(g);
+    return 0;
+}
+
+/* A join or put can block for a while: if one is still running after a
+ * short wait, a background thread finishes the shutdown so the window
+ * never freezes and the node never lingers. */
+void game_free(Game *g) {
+    double until;
+    int busy;
+    if (!g) return;
+    g->quitting = 1;
+    until = plat_now() + 0.5;
+    do {
+        Job *jobs[] = {&g->net, &g->put, &g->ghost_put, &g->lobby_put};
+        busy = 0;
+        for (size_t i = 0; i < sizeof jobs / sizeof jobs[0]; i++) busy |= jobs[i]->thread && !plat_thread_done(jobs[i]->thread);
+        if (busy) plat_sleep(20);
+    } while (busy && plat_now() < until);
+    if (busy) {
+        void *t = plat_thread(game_reap, g);
+        if (t) { plat_thread_detach(t); return; }
+    }
+    game_reap(g);
 }
 
 void game_host(Game *g) {
@@ -834,7 +853,11 @@ void game_join(Game *g, const char *code) {
     for (; *code && n < sizeof g->net.code - 1; code++)
         if (!isspace((unsigned char)*code)) g->net.code[n++] = (char)toupper((unsigned char)*code);
     g->net.code[n] = 0;
-    if (!job_start(g, &g->net, JOB_JOIN)) return;
+    if (!job_start(g, &g->net, JOB_JOIN)) {
+        g->state = ST_FAILED;
+        copy_str(g->status, sizeof g->status, "join failed: no worker thread");
+        return;
+    }
     g->state = ST_CONNECTING;
     snprintf(g->status, sizeof g->status, "joining %s...", g->net.code);
 }

@@ -227,6 +227,7 @@ void plat_sleep(int ms);
 void *plat_thread(int (*fn)(void *), void *arg);
 int plat_thread_done(void *t);
 void plat_thread_join(void *t);
+void plat_thread_detach(void *t); /* let it run; frees the handle */
 int plat_file_exists(const char *path);
 void plat_exe_dir(char *out, size_t cap);
 uint32_t plat_seed(void);

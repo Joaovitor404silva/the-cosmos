@@ -43,6 +43,10 @@ void plat_thread_join(void *t) {
     CloseHandle((HANDLE)t);
 }
 
+void plat_thread_detach(void *t) {
+    if (t) CloseHandle((HANDLE)t);
+}
+
 int plat_file_exists(const char *path) { return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES; }
 
 void plat_exe_dir(char *out, size_t cap) {
