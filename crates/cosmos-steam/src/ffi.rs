@@ -34,7 +34,8 @@ pub const DLL_ENV: &str = "COSMOS_STEAM_API";
 
 #[derive(Clone, Debug)]
 pub struct SteamConfig {
-    /// AppID for our own init; ignored when reusing the game's Steam.
+    /// AppID for our own init; ignored when reusing the game's Steam. 0:
+    /// none, so the path stays off unless the game already runs Steam.
     pub app_id: u32,
     /// Absolute path of the library to load (e.g. the copy shipped next to
     /// the exe). Debug builds fall back to `COSMOS_STEAM_API`. No search path
@@ -58,6 +59,8 @@ pub enum Unavailable {
     /// The process loaded Steam but hasn't initialized it: a Steam game that
     /// is still starting. Try again later.
     GameSteamNotReady,
+    /// We would init Steam ourselves but no AppID was configured.
+    NoAppId,
 }
 
 impl fmt::Display for Unavailable {
@@ -69,6 +72,7 @@ impl fmt::Display for Unavailable {
             Unavailable::InitFailed(e) => write!(f, "Steam init failed: {e}"),
             Unavailable::NotLoggedOn => f.write_str("Steam user not logged on"),
             Unavailable::GameSteamNotReady => f.write_str("the game loaded Steam but has not initialized it yet"),
+            Unavailable::NoAppId => f.write_str("no AppID configured for our own Steam init"),
         }
     }
 }
@@ -377,6 +381,9 @@ impl SteamApi {
     }
 
     fn init(lib: &Library, app_id: u32) -> Result<(), Unavailable> {
+        if app_id == 0 {
+            return Err(Unavailable::NoAppId);
+        }
         let running: FnBool = sym(lib, "SteamAPI_IsSteamRunning")?;
         // SAFETY: plain query, valid before init.
         if !unsafe { running() } {

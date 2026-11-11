@@ -33,6 +33,10 @@ pub fn new_nonce() -> Nonce {
     n
 }
 
+/// Bytes of the session tag on a hello.
+pub const TAG: usize = 16;
+
+/// An untagged `HELLO` (answered only by peers that asked for us).
 pub fn hello(nonce: &Nonce) -> Vec<u8> {
     hello_kind(HELLO, nonce)
 }
@@ -40,12 +44,34 @@ pub fn hello(nonce: &Nonce) -> Vec<u8> {
 pub fn hello_kind(kind: u8, nonce: &Nonce) -> Vec<u8> {
     let mut m = vec![kind];
     m.extend_from_slice(nonce);
+    m.extend_from_slice(&[0; TAG]);
+    m
+}
+
+fn tag(key: &[u8; 32], kind: u8, from: SteamId, to: SteamId, nonce: &Nonce) -> [u8; TAG] {
+    let d = cosmos_core::sealed::derive(key, &[b"cosmos-steam-hello:v1", &[kind], &from.to_be_bytes(), &to.to_be_bytes(), nonce]);
+    d[..TAG].try_into().unwrap()
+}
+
+/// A hello from `from` to `to` tagged with the session key, which proves
+/// the sender holds the join code (so the receiver may reveal its key).
+pub fn hello_tagged(kind: u8, nonce: &Nonce, key: Option<&[u8; 32]>, from: SteamId, to: SteamId) -> Vec<u8> {
+    let mut m = hello_kind(kind, nonce);
+    if let Some(k) = key {
+        m[1 + NONCE..].copy_from_slice(&tag(k, kind, from, to, nonce));
+    }
     m
 }
 
 /// Nonce of a `HELLO` or `HELLO_BACK`.
 pub fn parse_hello(m: &[u8]) -> Option<Nonce> {
-    (m.len() == 1 + NONCE && (m[0] == HELLO || m[0] == HELLO_BACK)).then(|| m[1..].try_into().unwrap())
+    (m.len() == 1 + NONCE + TAG && (m[0] == HELLO || m[0] == HELLO_BACK)).then(|| m[1..1 + NONCE].try_into().unwrap())
+}
+
+/// `m` is a hello `from` -> `to` carrying a valid tag for `key`.
+pub fn hello_tag_ok(m: &[u8], key: &[u8; 32], from: SteamId, to: SteamId) -> bool {
+    let Some(n) = parse_hello(m) else { return false };
+    cosmos_core::sealed::ct_eq(&m[1 + NONCE..], &tag(key, m[0], from, to, &n))
 }
 
 fn signed(signer: SteamId, receiver: SteamId, nonce: &Nonce) -> Vec<u8> {
@@ -117,5 +143,19 @@ mod tests {
         let n = new_nonce();
         assert_eq!(parse_hello(&hello(&n)), Some(n));
         assert_eq!(parse_hello(&hello(&n)[..5]), None);
+    }
+
+    #[test]
+    fn hello_tag_binds_key_ids_and_kind() {
+        let (k, n) = ([3u8; 32], new_nonce());
+        let m = hello_tagged(HELLO, &n, Some(&k), A, B);
+        assert_eq!(parse_hello(&m), Some(n));
+        assert!(hello_tag_ok(&m, &k, A, B));
+        assert!(!hello_tag_ok(&m, &[4u8; 32], A, B));
+        assert!(!hello_tag_ok(&m, &k, B, A));
+        assert!(!hello_tag_ok(&hello(&n), &k, A, B), "untagged hello passed");
+        let mut back = m.clone();
+        back[0] = HELLO_BACK;
+        assert!(!hello_tag_ok(&back, &k, A, B), "kind not bound");
     }
 }

@@ -213,7 +213,9 @@ typedef struct {
    */
   const char *cache_dir;
   /**
-   * Nonzero: LAN discovery (mDNS) and UPnP port mapping.
+   * Nonzero: LAN discovery (mDNS) and UPnP port mapping. Same-LAN play
+   * needs this or an explicit private `listen` IP; otherwise private
+   * addresses are neither advertised nor dialled.
    */
   int32_t lan;
   /**
@@ -227,7 +229,9 @@ typedef struct {
   const char *steam_dll;
   /**
    * AppID for our own Steam init (ignored when the game already runs
-   * Steam). 0: 480.
+   * Steam). Release builds with 0 never init Steam themselves: the path
+   * stays off unless the game runs Steam. Debug builds fall back to 480
+   * (Spacewar).
    */
   uint32_t steam_app_id;
   /**

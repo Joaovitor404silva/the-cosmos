@@ -1,45 +1,55 @@
-//! Peer -> SteamID discovery: each node with Steam publishes a signed DHT
-//! record (publisher = its PeerId) carrying its SteamID. Only a hint for whom
-//! to message; the binding handshake still decides who is who.
+//! Peer -> SteamID discovery for session members. Each member with Steam
+//! publishes a signed DHT record (publisher = its PeerId) whose SteamID is
+//! encrypted with the session key, under a topic derived from that key and
+//! its PeerId. Outsiders see neither the SteamID, which records are Steam
+//! records, nor which members share a session. Only a hint for whom to message; the binding handshake still
+//! decides who is who.
 
 use crate::backend::SteamId;
+use cosmos_core::sealed;
 use cosmos_net::{Node, PeerId, Record};
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-pub const STEAM_TOPIC: &str = "cosmos/steam";
-const MAGIC: &[u8] = b"cosmos-steamid:v1";
+const MAGIC: &[u8] = b"cosmos-steamid:v2";
 
-/// Record payload: magic, SteamID, AppID.
-pub fn encode(steam: SteamId, app_id: u32) -> Vec<u8> {
-    let mut d = MAGIC.to_vec();
-    d.extend_from_slice(&steam.to_be_bytes());
-    d.extend_from_slice(&app_id.to_be_bytes());
-    d
+/// The record topic of one member under one session key.
+pub fn topic(key: &[u8; 32], peer: &PeerId) -> String {
+    let d = sealed::derive(key, &[MAGIC, b"topic", &peer.to_bytes()]);
+    let hex: String = d[..16].iter().map(|b| format!("{b:02x}")).collect();
+    format!("cosmos/s/{hex}")
 }
 
-pub fn decode(d: &[u8]) -> Option<(SteamId, u32)> {
-    let rest = d.strip_prefix(MAGIC)?;
-    if rest.len() != 12 {
+fn aead_key(key: &[u8; 32]) -> [u8; 32] {
+    sealed::derive(key, &[MAGIC, b"key"])
+}
+
+/// Record payload: the SteamID, sealed.
+pub fn encode(key: &[u8; 32], peer: &PeerId, steam: SteamId) -> Vec<u8> {
+    sealed::seal(&aead_key(key), topic(key, peer).as_bytes(), &steam.to_be_bytes())
+}
+
+pub fn decode(key: &[u8; 32], peer: &PeerId, d: &[u8]) -> Option<SteamId> {
+    let p = sealed::open(&aead_key(key), topic(key, peer).as_bytes(), d)?;
+    let steam = u64::from_be_bytes(p.as_slice().try_into().ok()?);
+    (steam != 0).then_some(steam)
+}
+
+/// The SteamID in `rec`, if `peer` signed it under the session's topic.
+pub fn from_record(key: &[u8; 32], rec: &Record, peer: PeerId) -> Option<SteamId> {
+    if rec.topic != topic(key, &peer) || rec.publisher != peer {
         return None;
     }
-    let steam = u64::from_be_bytes(rest[..8].try_into().unwrap());
-    (steam != 0).then(|| (steam, u32::from_be_bytes(rest[8..].try_into().unwrap())))
+    decode(key, &peer, &rec.data)
 }
 
-/// The SteamID in `rec`, if `peer` signed it under the Steam topic.
-pub fn from_record(rec: &Record, peer: PeerId) -> Option<(SteamId, u32)> {
-    if rec.topic != STEAM_TOPIC || rec.publisher != peer {
-        return None;
-    }
-    decode(&rec.data)
-}
-
-/// Announce our SteamID (call again before the node's record TTL runs out).
-pub async fn publish_steam_id(node: &Node, steam: SteamId, app_id: u32) -> anyhow::Result<()> {
-    node.publish(STEAM_TOPIC, encode(steam, app_id)).await
+/// Announce our SteamID to session members (call again before the node's
+/// record TTL runs out).
+pub async fn publish_steam_id(node: &Node, key: &[u8; 32], steam: SteamId) -> anyhow::Result<()> {
+    let me = node.peer_id();
+    node.publish(&topic(key, &me), encode(key, &me, steam)).await
 }
 
 /// Where to find a peer's SteamID.
@@ -47,16 +57,30 @@ pub trait SteamDirectory: Send + Sync + 'static {
     fn lookup(&self, peer: PeerId) -> BoxFuture<'_, Option<SteamId>>;
 }
 
-/// The DHT records published with `publish_steam_id`.
+/// The DHT records published with `publish_steam_id`; finds nothing until
+/// the session key is set.
 pub struct DhtDirectory {
     pub node: Node,
+    key: Mutex<Option<[u8; 32]>>,
+}
+
+impl DhtDirectory {
+    pub fn new(node: Node) -> Self {
+        Self { node, key: Mutex::new(None) }
+    }
+
+    pub fn set_key(&self, key: [u8; 32]) {
+        *self.key.lock().unwrap() = Some(key);
+    }
 }
 
 impl SteamDirectory for DhtDirectory {
     fn lookup(&self, peer: PeerId) -> BoxFuture<'_, Option<SteamId>> {
+        let key = *self.key.lock().unwrap();
         async move {
-            let rec = self.node.get(STEAM_TOPIC, peer).await.ok()??;
-            from_record(&rec, peer).map(|(s, _)| s)
+            let key = key?;
+            let rec = self.node.get(&topic(&key, &peer), peer).await.ok()??;
+            from_record(&key, &rec, peer)
         }
         .boxed()
     }
@@ -89,14 +113,21 @@ mod tests {
     fn record_roundtrip_and_publisher_check() {
         let k = Keypair::generate_ed25519();
         let me = k.public().to_peer_id();
-        let bytes = Record::sign(&k, STEAM_TOPIC, encode(76561198000000001, 480), Duration::from_secs(60)).unwrap();
+        let key = [5u8; 32];
+        let sid: SteamId = 76561198000000001;
+        let bytes = Record::sign(&k, &topic(&key, &me), encode(&key, &me, sid), Duration::from_secs(60)).unwrap();
         let rec = Record::verify(&bytes).unwrap();
-        assert_eq!(from_record(&rec, me), Some((76561198000000001, 480)));
+        assert_eq!(from_record(&key, &rec, me), Some(sid));
         // Someone else's record does not speak for `me`.
-        assert_eq!(from_record(&rec, PeerId::random()), None);
-        let other = Record::verify(&Record::sign(&k, "cosmos/addr", encode(1, 480), Duration::from_secs(60)).unwrap()).unwrap();
-        assert_eq!(from_record(&other, me), None);
-        assert_eq!(decode(&encode(0, 480)), None);
-        assert_eq!(decode(b"junk"), None);
+        assert_eq!(from_record(&key, &rec, PeerId::random()), None);
+        // Audit finding 2: outsiders can't read the SteamID or spot the topic.
+        assert!(!rec.data.windows(8).any(|w| w == sid.to_be_bytes()), "SteamID in clear");
+        assert!(!rec.topic.contains("steam"));
+        assert_eq!(from_record(&[6u8; 32], &rec, me), None);
+        assert_ne!(topic(&key, &me), topic(&[6u8; 32], &me));
+        // Review finding 4: members of one session don't share a topic.
+        assert_ne!(topic(&key, &me), topic(&key, &PeerId::random()));
+        assert_eq!(decode(&key, &me, b"junk"), None);
+        assert_eq!(decode(&key, &me, &encode(&key, &me, 0)), None);
     }
 }

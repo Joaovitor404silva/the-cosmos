@@ -6,18 +6,26 @@
 //! proved which Cosmos peer is behind it.
 //!
 //! Bindings heal themselves:
-//! - frames from an unbound SteamID make us ask it for a proof;
+//! - frames from a SteamID we were recently bound to, asked for, or that
+//!   showed the session key make us ask it for a proof (anyone else gets
+//!   silence: no presence oracle);
+
 //! - a `HELLO` from a bound SteamID makes us re-check it, so a peer that
 //!   restarted with a new key on the same Steam account rebinds (the old
 //!   peer gets `Down`);
 //! - `connect` on a bound peer re-proves it, so `PathSet` reconnecting a dead
 //!   path never trusts a stale binding.
 //!
+//! Privacy: a proof reveals our Cosmos key (and so, via the DHT, our IP).
+//! We only answer a `HELLO` tagged with the session key (it holds the join
+//! code) or one from a SteamID we asked for ourselves; strangers get silence.
+//!
 //! Frames over one Steam message are split into pieces (reliable only).
 //! Strangers get at most half the handshake slots and a bounded number of
 //! bindings, and proofs are rate limited.
 
 use crate::backend::{MAX_MESSAGE, SendError, SteamBackend, SteamEvent, SteamId};
+
 use crate::bind::{self, DATA, FRAG, FRAG_FIRST, FRAG_LAST, HELLO, HELLO_BACK, Nonce, PROOF};
 use crate::record::SteamDirectory;
 use cosmos_core::transport::FRAME_MAX;
@@ -29,6 +37,10 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// How long an unbound SteamID may re-ask for a proof, and how many we keep.
+const KNOWN_TTL: Duration = Duration::from_secs(120);
+const MAX_KNOWN: usize = 64;
 use tokio::sync::{Notify, mpsc};
 
 #[derive(Clone, Debug)]
@@ -95,16 +107,31 @@ struct State {
     /// Frames being rebuilt from pieces.
     asm: HashMap<SteamId, Vec<u8>>,
     tokens: (u32, Option<Instant>),
+    /// Recently unbound SteamIDs: their frames may still re-ask for a proof.
+    known: HashMap<SteamId, Instant>,
 }
 
 impl State {
     fn unbind(&mut self, steam: SteamId) -> Option<PeerId> {
         let b = self.by_steam.remove(&steam)?;
+        self.remember(steam);
         if self.by_peer.get(&b.peer) == Some(&steam) {
             self.by_peer.remove(&b.peer);
         }
         self.asm.remove(&steam);
         Some(b.peer)
+    }
+
+    /// `steam` may re-ask for a proof for a while (we were bound to it, or
+    /// it showed the session key, or we asked for it).
+    fn remember(&mut self, steam: SteamId) {
+        if !self.known.contains_key(&steam)
+            && self.known.len() >= MAX_KNOWN
+            && let Some(old) = self.known.iter().min_by_key(|(_, t)| **t).map(|(k, _)| *k)
+        {
+            self.known.remove(&old);
+        }
+        self.known.insert(steam, Instant::now());
     }
 
     fn strangers_pending(&self) -> usize {
@@ -143,6 +170,8 @@ struct Shared {
     dir: Arc<dyn SteamDirectory>,
     cfg: SteamTransportConfig,
     state: Mutex<State>,
+    /// The join code's session key (see `set_session_key`).
+    session: Mutex<Option<[u8; 32]>>,
     bound: Notify,
     events: mpsc::Sender<TransportEvent>,
 }
@@ -176,6 +205,7 @@ impl SteamTransport {
             dir,
             cfg,
             state: Mutex::new(State::default()),
+            session: Mutex::new(None),
             bound: Notify::new(),
             events,
         });
@@ -190,6 +220,14 @@ impl SteamTransport {
 
     pub fn steam_id(&self) -> SteamId {
         self.shared.my_steam
+    }
+
+    /// The session key (from the join advert): tags our hellos and admits
+    /// members'. Both sides need it before `connect_steam` can bind: until
+    /// the other side has it, our HELLO goes unanswered and `connect_steam`
+    /// keeps retrying until its handshake timeout.
+    pub fn set_session_key(&self, key: [u8; 32]) {
+        *self.shared.session.lock().unwrap() = Some(key);
     }
 
     /// The SteamID bound to `peer`, if the handshake completed.
@@ -227,7 +265,9 @@ impl SteamTransport {
                     return Ok(peer);
                 }
                 let now = Instant::now();
+                st.remember(steam);
                 if !st.pending.contains_key(&steam) && st.pending.len() >= s.cfg.max_pending {
+
                     // Our own connects outrank strangers: evict the oldest one.
                     let old = st.pending.iter().filter(|(_, p)| !p.outbound).min_by_key(|(_, p)| p.since).map(|(k, _)| *k);
                     match old {
@@ -252,7 +292,7 @@ impl SteamTransport {
                 p.nonce
             };
             s.backend.allow(steam);
-            match s.backend.send(steam, &bind::hello(&nonce), true) {
+            match s.backend.send(steam, &s.hello(HELLO, &nonce, steam), true) {
                 Ok(()) | Err(SendError::Full) => {}
                 Err(e) => tracing::debug!(steam, ?e, "steam hello failed"),
             }
@@ -272,6 +312,18 @@ impl SteamTransport {
 }
 
 impl Shared {
+    fn hello(&self, kind: u8, nonce: &Nonce, to: SteamId) -> Vec<u8> {
+        let key = *self.session.lock().unwrap();
+        bind::hello_tagged(kind, nonce, key.as_ref(), self.my_steam, to)
+    }
+
+    /// May `from` learn our key? It holds the session key, or we asked for it.
+    fn trusted(&self, st: &State, from: SteamId, hello: &[u8]) -> bool {
+        st.pending.get(&from).is_some_and(|p| p.outbound)
+            || st.by_steam.get(&from).is_some_and(|b| b.wanted)
+            || self.session.lock().unwrap().is_some_and(|k| bind::hello_tag_ok(hello, &k, from, self.my_steam))
+    }
+
     fn pump(self: Arc<Self>, stop: &AtomicBool) {
         let mut buf = Vec::new();
         let mut last_gc = Instant::now();
@@ -293,7 +345,9 @@ impl Shared {
             if last_gc.elapsed() >= Duration::from_secs(1) {
                 last_gc = Instant::now();
                 let ttl = self.cfg.handshake_timeout * 2;
-                self.state.lock().unwrap().pending.retain(|_, p| p.since.elapsed() < ttl);
+                let mut st = self.state.lock().unwrap();
+                st.pending.retain(|_, p| p.since.elapsed() < ttl);
+                st.known.retain(|_, t| t.elapsed() < KNOWN_TTL);
             }
         }
     }
@@ -311,13 +365,17 @@ impl Shared {
                 let Some(nonce) = bind::parse_hello(&data) else { return };
                 let (back, sign) = {
                     let mut st = self.state.lock().unwrap();
+                    if !self.trusted(&st, from, &data) {
+                        return;
+                    }
+                    st.remember(from);
                     // A HELLO (not a HELLO_BACK) is a reason to (re)check them:
                     // they may be new, or a new key on a bound SteamID.
                     let back = if kind == HELLO { st.pending_inbound(from, self.cfg.max_pending) } else { None };
                     (back, st.take_token(self.cfg.proofs_per_sec))
                 };
                 if let Some(n) = back {
-                    let _ = self.backend.send(from, &bind::hello_kind(HELLO_BACK, &n), true);
+                    let _ = self.backend.send(from, &self.hello(HELLO_BACK, &n, from), true);
                 }
                 if sign {
                     let _ = self.backend.send(from, &bind::proof(&self.key, self.my_steam, from, &nonce), true);
@@ -331,18 +389,21 @@ impl Shared {
     fn on_data(&self, from: SteamId, kind: u8, mut data: Vec<u8>) {
         let mut st = self.state.lock().unwrap();
         let Some(b) = st.by_steam.get_mut(&from) else {
-            // They think we are bound: ask who they are (rate limited).
+            // They think we are bound: ask who they are (rate limited), if we
+            // ever were bound to them.
+            let known = st.known.contains_key(&from);
             let ask = match st.pending.get_mut(&from) {
                 Some(p) if p.last_hello.elapsed() >= self.cfg.hello_every => {
                     p.last_hello = Instant::now();
                     Some(p.nonce)
                 }
                 Some(_) => None,
-                None => st.pending_inbound(from, self.cfg.max_pending),
+                None if known => st.pending_inbound(from, self.cfg.max_pending),
+                None => None,
             };
             drop(st);
             if let Some(n) = ask {
-                let _ = self.backend.send(from, &bind::hello(&n), true);
+                let _ = self.backend.send(from, &self.hello(HELLO, &n, from), true);
             }
             return;
         };

@@ -35,12 +35,12 @@ Spec: `docs/specs/2026-11-10-cosmos-sdk-design.md`. Workflow: unit TDD per task 
 
 ## M6 — Cosmos Depths (example game, ships in the SDK)
 - [x] `examples/cosmos-depths`, C + raylib co-op roguelike: seed + intents + host tick snapshots/events + prediction + late join (sync), notes + death marks by depth (async), path HUD, join code. (`tests/depths_c.rs` builds it with MSVC and runs `--selftest`: same map from the seed, predicted move, kill seen by all, late 4th joiner synced, note live by subscription and queried back by a fresh instance, death mark queried back; proof image `docs/img/cosmos-depths.png`.)
-- [ ] Live: 4 instances on 2 PCs, then cross-network with a remote friend; record a short showcase clip.
+- [ ] Live: 4 instances on 2 PCs, then cross-network with a remote tester; record a short showcase clip.
 
 ## M7 — Hardening
 - [ ] Security audit of the whole SDK before any public release.
 
 ## Later (not in this plan)
-- `cosmos-node` daemon + facades, then other games (Bloodborne via a game port first).
+- `cosmos-node` daemon + facades, then other games.
 
 Done = each milestone's tests green, opus review clean, live checks passed and recorded here.

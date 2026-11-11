@@ -95,18 +95,18 @@ async fn four_peers_join_by_code_and_exchange_1k_in_order() {
     let addrs = host_node.listen_addrs().await;
     let adv = retry("advertise", || code::advertise(&host_node, NS, addrs.clone())).await;
     let code = code::pretty(&adv.code);
-    // Host admits only code holders; joiners derive the secret from the code.
-    assert_eq!(adv.secret, code::join_secret(NS, &adv.code));
+    // Host admits only code holders; joiners get the secret from the sealed advert.
     let cfg = SessionConfig { join_secret: Some(adv.secret), ..cfg };
     let mut host = Session::host(transport(&host_node, &cfg), cfg.clone()).await.unwrap();
 
     // The 5th node also publishes a forged advert under the same topic: it
     // copies the host id and real salt but points at its own addresses.
-    let host_advert = code::pick(&host_node.find(&code::topic(NS, &adv.code)).await.unwrap(), NS, &adv.code, now())
+    let keys = code::keys_today(NS, &adv.code).await.unwrap();
+    let host_advert = code::pick(&host_node.find(&keys.topic).await.unwrap(), NS, &adv.code, &keys, now())
         .expect("host advert visible");
-    let forged = Advert { host: host_node.peer_id(), addrs: fifth.listen_addrs().await, salt: host_advert.salt };
-    let topic = code::topic(NS, &adv.code);
-    retry("forge", || fifth.publish(&topic, forged.encode(NS))).await;
+    assert_eq!((host_advert.secret, host_advert.session), (adv.secret, adv.session));
+    let forged = Advert { host: host_node.peer_id(), addrs: fifth.listen_addrs().await, ..host_advert };
+    retry("forge", || fifth.publish(&keys.topic, forged.seal(NS, &keys))).await;
 
     let mut members = vec![];
     for n in &nodes {

@@ -4,6 +4,7 @@ pub mod channel;
 pub mod code;
 pub mod path;
 pub mod records;
+pub mod sealed;
 pub mod session;
 pub mod transport;
 

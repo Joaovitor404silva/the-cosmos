@@ -23,7 +23,7 @@ pub struct SessionConfig {
     pub max_peers: usize,
     pub caps: ChannelCaps,
     pub join_timeout: Duration,
-    /// Host: admit only joiners presenting this (`code::join_secret`).
+    /// Host: admit only joiners presenting this (`Advertisement::secret`).
     /// Joiner: the secret to present. `None` on the host admits anyone.
     pub join_secret: Option<[u8; 16]>,
 }

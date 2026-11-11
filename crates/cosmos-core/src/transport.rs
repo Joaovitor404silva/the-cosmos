@@ -385,7 +385,7 @@ impl Transport for NetTransport {
     }
 
     fn local_addrs(&self) -> BoxFuture<'_, Vec<Multiaddr>> {
-        self.shared.node.listen_addrs().boxed()
+        self.shared.node.advertised_addrs().boxed()
     }
 
     fn connect(&self, peer: PeerId, addrs: Vec<Multiaddr>) -> BoxFuture<'_, anyhow::Result<()>> {
@@ -393,7 +393,7 @@ impl Transport for NetTransport {
             let node = &self.shared.node;
             if node.connections(peer).await.is_empty() {
                 for a in addrs {
-                    let _ = node.dial(a).await;
+                    let _ = node.dial_hint(a).await;
                 }
             }
             node.connect(peer).await?;
