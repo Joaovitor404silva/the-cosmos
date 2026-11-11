@@ -593,7 +593,7 @@ fn load_key_from(path: PathBuf, tries: u32) -> Result<Keypair, Fail> {
             match write_new_key(&path, &b) {
                 Ok(()) => Ok(k),
                 // Another instance created it first: use theirs.
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => load_key_from(path, tries),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && tries < 20 => load_key_from(path, tries + 1),
                 Err(e) => Err(fail(COSMOS_E_IO, format!("key file: {e}"))),
             }
         }

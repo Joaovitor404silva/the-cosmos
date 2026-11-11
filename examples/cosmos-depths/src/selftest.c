@@ -107,6 +107,12 @@ static int has_ghost(const Game *x, const Game *of) {
 }
 
 static int ghost_fresh(void) { return has_ghost(fresh, g[1]); }
+static int lobby_listed(void) {
+    for (int k = 0; k < fresh->n_lobbies; k++)
+        if (!strcmp(fresh->lobbies[k].code, g[0]->code) && fresh->lobbies[k].players == 4 && fresh->lobbies[k].depth == g[0]->lv.depth)
+            return 1;
+    return 0;
+}
 static int put1_done(void) { return g[1]->puts_done > 0; }
 static int put3_done(void) { return g[3]->puts_done > 0; }
 static int note_live(void) { return has_mark(g[2], 0, g[1], NOTE_TEXT); }
@@ -144,6 +150,7 @@ int selftest(void) {
         }
     }
     g[0]->peaceful = 1; /* monsters stand still: the checks move them */
+    g[0]->public_run = 1;
 
     game_host(g[0]);
     while (g[0]->state == ST_CONNECTING) { pump(); plat_sleep(10); }
@@ -220,6 +227,11 @@ int selftest(void) {
         for (int j = 0; j < N; j++)
             if (has_ghost(g[i], g[j])) { fail("a player saw a ghost of its own party"); goto out; }
     printf("ok: player 1's ghost seen live from another run, never by its own party\n");
+
+    game_browse(fresh);
+    if (!wait_for(lobby_listed, 30)) { fail("lobby list"); goto out; }
+    printf("ok: the public run is in the lobby list with its code, 4/4 players, depth\n");
+
     r = 0;
 
 

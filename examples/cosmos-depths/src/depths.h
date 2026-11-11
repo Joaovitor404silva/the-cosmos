@@ -19,8 +19,12 @@
 #define NOTE_MAX 48
 #define MAX_MARKS 32
 #define MAX_GHOSTS 16
-#define GHOST_EVERY 3.0 /* s between ghost puts */
-#define GHOST_FADE 8.0  /* s a ghost stays visible without news */
+#define GHOST_EVERY 5.0 /* s between ghost puts (2 of the SDK's 10 puts per 10 s) */
+#define GHOST_FADE 12.0 /* s a ghost stays visible without news */
+
+#define MAX_LOBBIES 9
+#define LOBBY_EVERY 20.0 /* s between a public host's listing puts */
+#define LOBBY_SHOW 60.0  /* s a listing stays in the list without news */
 #define LOG_LINES 6
 #define TICK_HZ 6
 #define PLAYER_HP 20
@@ -115,6 +119,15 @@ typedef struct {
     double seen; /* game time of the last record */
 } Ghost;
 
+/* A public run in the lobby list. */
+typedef struct {
+    uint8_t pub[COSMOS_PEER_ID_MAX];
+    size_t pub_len;
+    char code[COSMOS_CODE_MAX];
+    int players, depth;
+    double seen;
+} Lobby;
+
 /* One blocking cosmos call on a worker thread. */
 typedef struct {
     void *thread;
@@ -171,7 +184,12 @@ typedef struct Game {
     int n_marks, marks_depth;
     int sub_note, sub_grave, sub_ghost;
     uint32_t req;
-    Job net, put, ghost_put;
+    Job net, put, ghost_put, lobby_put;
+    int public_run;  /* host: list this run in the lobby list (code public) */
+    int browsing, sub_lobby;
+    Lobby lobbies[MAX_LOBBIES];
+    int n_lobbies;
+    double next_lobby, next_browse;
     Ghost ghosts[MAX_GHOSTS];
     int n_ghosts;
     double now, next_ghost;
@@ -186,6 +204,8 @@ Game *game_new(const DepthsConfig *cfg, char *err, size_t cap);
 void game_free(Game *g);
 void game_host(Game *g);
 void game_join(Game *g, const char *code);
+void game_browse(Game *g);                  /* fill g->lobbies with public runs */
+
 void game_update(Game *g, double now);
 int game_input(Game *g, int act);           /* queue an intent; 0 if full or dead */
 int game_put_note(Game *g, const char *text); /* at my spot; 0 if busy */

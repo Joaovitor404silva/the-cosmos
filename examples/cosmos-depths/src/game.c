@@ -17,6 +17,10 @@
  * Async plane (records under key "d<depth>", so any run reaches them):
  *   "note"  [room, dx, dy, text]   a player's note on a floor tile
  *   "grave" [room, dx, dy, cause]  where and how a player died
+ *   "lobby" [players, depth u16, code]  under key "open": a public run's
+ *                                  listing, put every 20 s by its host
+ *                                  while it opts in. Anyone can read the
+ *                                  code and join (that is the point).
  *   "ghost" [room, dx, dy, tag]    where a living player is now; put every
  *                                  few seconds, short TTL. Other runs on
  *                                  the same depth draw it as a faint @; a
@@ -40,7 +44,8 @@ enum { MSG_HELLO = 'H', MSG_LEVEL = 'L', MSG_INTENT = 'I', MSG_SNAP = 'S', MSG_E
 enum { EVT_KILL = 1, EVT_DEATH, EVT_PICKUP };
 
 #define RECORD_TTL 1800u /* the SDK's cap: 30 minutes */
-#define GHOST_TTL 10u
+#define GHOST_TTL 15u
+#define LOBBY_TTL 60u
 #define VIEW 9           /* monsters notice players this close */
 #define POTION_HP 8
 #define CAUSE_MAX 40
@@ -256,6 +261,32 @@ static void spot_bytes(const Game *g, int x, int y, uint8_t out[3]) {
     out[2] = (uint8_t)(dy < 0 ? 0 : dy);
 }
 
+static void on_lobby(Game *g, const cosmos_event_t *ev) {
+    Lobby *l = NULL;
+    char code[COSMOS_CODE_MAX];
+    size_t n = ev->len - 3;
+    if (n != 9) return; /* XXXX-XXXX */
+    for (size_t i = 0; i < n; i++) {
+        char c = (char)ev->data[3 + i];
+        if (!(c == '-' || (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z'))) return;
+        code[i] = c;
+    }
+    code[n] = 0;
+    for (int i = 0; i < g->n_lobbies && !l; i++)
+        if (g->lobbies[i].pub_len == ev->publisher_len && !memcmp(g->lobbies[i].pub, ev->publisher, ev->publisher_len)) l = &g->lobbies[i];
+    if (!l && g->n_lobbies < MAX_LOBBIES) l = &g->lobbies[g->n_lobbies++];
+    if (!l) { /* full: replace the stalest */
+        l = &g->lobbies[0];
+        for (int i = 1; i < MAX_LOBBIES; i++) if (g->lobbies[i].seen < l->seen) l = &g->lobbies[i];
+    }
+    memcpy(l->pub, ev->publisher, ev->publisher_len);
+    l->pub_len = ev->publisher_len;
+    copy_str(l->code, sizeof l->code, code);
+    l->players = ev->data[0];
+    l->depth = get_u16(ev->data + 1);
+    l->seen = g->now;
+}
+
 static void on_ghost(Game *g, const cosmos_event_t *ev) {
     Ghost *gh = NULL;
     uint32_t tag;
@@ -296,6 +327,10 @@ static void on_record(Game *g, const cosmos_event_t *ev) {
     if (ev->error != COSMOS_OK || !ev->data || !ev->record_kind || !ev->record_key || ev->len < 4 ||
         ev->len > 3 + NOTE_MAX || ev->publisher_len > COSMOS_PEER_ID_MAX)
         return;
+    if (!strcmp(ev->record_kind, "lobby")) {
+        if (g->browsing && !strcmp(ev->record_key, "open")) on_lobby(g, ev);
+        return;
+    }
     depth_key(key, sizeof key, g->marks_depth);
     if (strcmp(ev->record_key, key)) return; /* an older depth's answer */
     if (!strcmp(ev->record_kind, "ghost")) {
@@ -772,15 +807,15 @@ void game_free(Game *g) {
     double until;
     if (!g) return;
     g->quitting = 1;
-    until = plat_now() + 1.5;
-    while ((g->net.thread && !plat_thread_done(g->net.thread)) || (g->put.thread && !plat_thread_done(g->put.thread)) ||
-           (g->ghost_put.thread && !plat_thread_done(g->ghost_put.thread))) {
-        if (plat_now() > until) return;
-        plat_sleep(20);
-    }
-    plat_thread_join(g->net.thread);
-    plat_thread_join(g->put.thread);
-    plat_thread_join(g->ghost_put.thread);
+    until = plat_now() + 4; /* ghost/lobby puts are usually in flight */
+    Job *jobs[] = {&g->net, &g->put, &g->ghost_put, &g->lobby_put};
+    for (size_t i = 0; i < sizeof jobs / sizeof jobs[0]; i++)
+        while (jobs[i]->thread && !plat_thread_done(jobs[i]->thread)) {
+            if (plat_now() > until) return;
+            plat_sleep(20);
+        }
+    for (size_t i = 0; i < sizeof jobs / sizeof jobs[0]; i++) plat_thread_join(jobs[i]->thread);
+
     cosmos_shutdown(g->c);
     free(g);
 }
@@ -795,6 +830,7 @@ void game_host(Game *g) {
 void game_join(Game *g, const char *code) {
     size_t n = 0;
     if (g->state != ST_IDLE || g->net.thread) return;
+    g->browsing = 0;
     for (; *code && n < sizeof g->net.code - 1; code++)
         if (!isspace((unsigned char)*code)) g->net.code[n++] = (char)toupper((unsigned char)*code);
     g->net.code[n] = 0;
@@ -912,12 +948,57 @@ static void collect_jobs(Game *g) {
     }
 }
 
+void game_browse(Game *g) {
+    if (g->state != ST_IDLE || g->browsing) return;
+    g->browsing = 1;
+    g->n_lobbies = 0;
+    g->next_browse = 0;
+    g->sub_lobby = cosmos_record_subscribe(g->c, "lobby", "open");
+}
+
+/* Browsing: ask again every few seconds; drop listings gone quiet. */
+static void browse_tick(Game *g) {
+    if (!g->browsing) {
+        if (g->sub_lobby > 0) cosmos_record_unsubscribe(g->c, g->sub_lobby);
+        g->sub_lobby = 0;
+        return;
+    }
+    for (int i = 0; i < g->n_lobbies; i++)
+        if (g->now - g->lobbies[i].seen > LOBBY_SHOW) g->lobbies[i--] = g->lobbies[--g->n_lobbies];
+    if (g->now < g->next_browse) return;
+    g->next_browse = g->now + 5;
+    cosmos_record_query(g->c, "lobby", "open", ++g->req);
+}
+
+/* A public host keeps its listing fresh (players, depth). */
+static void lobby_tick(Game *g) {
+    Job *j = &g->lobby_put;
+    size_t n = strlen(g->code);
+    job_finished(j);
+    if (!g->public_run || !g->is_host || g->state != ST_PLAYING || !g->have_level || g->now < g->next_lobby || j->thread ||
+        n != 9)
+        return;
+    g->next_lobby = g->now + LOBBY_EVERY;
+    j->data[0] = (uint8_t)game_player_count(g);
+    put_u16(j->data + 1, (uint16_t)g->lv.depth);
+    memcpy(j->data + 3, g->code, n);
+    j->len = 3 + n;
+    j->ttl = LOBBY_TTL;
+    copy_str(j->kind, sizeof j->kind, "lobby");
+    copy_str(j->key, sizeof j->key, "open");
+    job_start(g, j, JOB_PUT);
+}
+
 /* While alive, tell other runs on this depth where I am. A failed put
  * (rate limit, no peers yet) just waits for the next one. */
 static void ghost_tick(Game *g) {
     Player *me = game_me(g);
     Job *j = &g->ghost_put;
     job_finished(j);
+    /* A ghost that arrived before its player showed up in my own run. */
+    for (int i = 0; i < g->n_ghosts; i++)
+        if (game_slot_of(g, g->ghosts[i].tag) >= 0) g->ghosts[i--] = g->ghosts[--g->n_ghosts];
+
     if (g->state != ST_PLAYING || !g->have_level || !me || me->hp <= 0 || g->now < g->next_ghost || j->thread) return;
     g->next_ghost = g->now + GHOST_EVERY;
     spot_bytes(g, g->me_x, g->me_y, j->data);
@@ -934,6 +1015,8 @@ void game_update(Game *g, double now) {
     collect_jobs(g);
     poll_events(g);
     ghost_tick(g);
+    lobby_tick(g);
+    browse_tick(g);
 
     if (!g->is_host || g->state != ST_PLAYING) return;
     if (now >= g->next_tick) {

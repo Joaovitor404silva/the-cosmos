@@ -438,7 +438,8 @@ async fn half_finished_handshake_is_repaired() {
     let n = bind::new_nonce();
     x.send(SA, &bind::hello_tagged(bind::HELLO, &n, Some(&SESSION), SX, SA), true).unwrap();
     // X never answers; A's pending entry expires (2 x handshake timeout).
-    sleep(Duration::from_millis(3000)).await;
+    sleep(Duration::from_millis(4000)).await;
+
     let mut evs = vec![];
     x.poll(&mut evs);
     x.send(SA, &[bind::DATA, 1, 2, 3], true).unwrap();

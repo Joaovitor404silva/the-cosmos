@@ -1,7 +1,8 @@
 /* Cosmos Depths: window, menu, input and drawing (raylib), ASCII style.
  *
- *   cosmos-depths                   menu: H host, J join by code
- *   cosmos-depths --host | --join CODE
+ *   cosmos-depths                   menu: H host, P host public, L lobby
+ *                                   list, J join by code
+ *   cosmos-depths --host [--public] | --join CODE | --browse
  *   cosmos-depths --selftest        headless loopback test, exit 0 / 1
  * Settings: cosmos-depths.ini next to the exe, then --name value flags
  * (listen, bootstrap, lan, steam, key, cache, app-id, addr-file).
@@ -24,7 +25,7 @@
 #define WIN_H (LOG_Y + LOG_LINES * 18 + 30)
 #define SIGHT 8
 
-enum { SCR_MENU, SCR_CODE, SCR_GAME };
+enum { SCR_MENU, SCR_CODE, SCR_LOBBY, SCR_GAME };
 
 static const Color BG = {10, 10, 16, 255};
 static const Color WALL = {120, 110, 150, 255};
@@ -242,7 +243,7 @@ static int bot_action(Game *g) {
 int main(int argc, char **argv) {
     DepthsConfig cfg;
     char path[300], code[COSMOS_CODE_MAX] = "", note[NOTE_MAX + 1] = "", err[256] = "", shot[300] = "", join_file[300] = "";
-    int screen = SCR_MENU, typing = 0, bot = 0, host_now = 0, wx = -1, wy = -1;
+    int screen = SCR_MENU, typing = 0, bot = 0, host_now = 0, public_now = 0, browse_now = 0, wx = -1, wy = -1;
     double shot_after = 8, played = 0, next_step = 0, quit_at = 0;
     Game *g = NULL;
 
@@ -256,6 +257,8 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : "";
         if (!strcmp(a, "--host")) host_now = 1;
+        else if (!strcmp(a, "--public")) public_now = 1;
+        else if (!strcmp(a, "--browse")) browse_now = 1;
         else if (!strcmp(a, "--bot")) bot = 1;
         else if (!strcmp(a, "--join") && *v == '@') { snprintf(join_file, sizeof join_file, "%s", v + 1); i++; }
         else if (!strcmp(a, "--join") && *v) { snprintf(code, sizeof code, "%s", v); i++; }
@@ -277,12 +280,14 @@ int main(int argc, char **argv) {
     font = plat_file_exists("C:\\Windows\\Fonts\\consola.ttf") ? LoadFontEx("C:\\Windows\\Fonts\\consola.ttf", 40, NULL, 0) : GetFontDefault();
     SetTextureFilter(font.texture, TEXTURE_FILTER_BILINEAR);
 
-    if (host_now || code[0] || join_file[0]) {
+    if (host_now || code[0] || join_file[0] || browse_now) {
         g = game_new(&cfg, err, sizeof err);
         if (g) {
+            g->public_run = public_now;
             if (host_now) game_host(g);
             else if (code[0]) game_join(g, code);
-            screen = SCR_GAME;
+            else if (browse_now) game_browse(g);
+            screen = browse_now && !host_now && !code[0] ? SCR_LOBBY : SCR_GAME;
         }
     }
 
@@ -291,12 +296,23 @@ int main(int argc, char **argv) {
 
         if (screen == SCR_MENU) {
             if (IsKeyPressed(KEY_ESCAPE)) break;
-            if (IsKeyPressed(KEY_H) || IsKeyPressed(KEY_J)) {
-                int host = IsKeyPressed(KEY_H);
-                while (GetCharPressed()) {} /* drop the H/J keystroke */
-                if (host && (g = game_new(&cfg, err, sizeof err))) { game_host(g); screen = SCR_GAME; }
-                else if (!host) { code[0] = 0; screen = SCR_CODE; }
+            if (IsKeyPressed(KEY_H) || IsKeyPressed(KEY_P) || IsKeyPressed(KEY_J) || IsKeyPressed(KEY_L)) {
+                int host = IsKeyPressed(KEY_H) || IsKeyPressed(KEY_P), pub = IsKeyPressed(KEY_P), list = IsKeyPressed(KEY_L);
+                while (GetCharPressed()) {} /* drop the keystroke */
+                err[0] = 0;
+                if ((host || list) && (g = game_new(&cfg, err, sizeof err))) {
+                    g->public_run = pub;
+                    if (host) game_host(g);
+                    else game_browse(g);
+                    screen = host ? SCR_GAME : SCR_LOBBY;
+                } else if (!host && !list) { code[0] = 0; screen = SCR_CODE; }
             }
+        } else if (screen == SCR_LOBBY) {
+            int pick = -1;
+            for (int k = 0; k < g->n_lobbies; k++) if (IsKeyPressed(KEY_ONE + k)) pick = k;
+            while (GetCharPressed()) {}
+            if (pick >= 0 && g->lobbies[pick].players < MAX_PLAYERS) { game_join(g, g->lobbies[pick].code); screen = SCR_GAME; }
+            else if (IsKeyPressed(KEY_ESCAPE)) { game_free(g); g = NULL; screen = SCR_MENU; }
         } else if (screen == SCR_CODE) {
             type_into(code, sizeof code, 1);
             if (IsKeyPressed(KEY_ESCAPE)) screen = SCR_MENU;
@@ -344,6 +360,7 @@ int main(int argc, char **argv) {
                 game_put_note(g, TextFormat("P%d was here. Mind the dark.", game_slot_of(g, g->my_tag) + 1));
             played += GetFrameTime();
         }
+        if (screen == SCR_LOBBY) played += GetFrameTime(); /* --shot of the list */
 
         BeginDrawing();
         ClearBackground(BG);
@@ -354,15 +371,28 @@ int main(int argc, char **argv) {
             text("COSMOS DEPTHS", 60, 110, 64, AMBER);
             text("a co-op descent for 1-4 players. Notes and graves outlive the run.", 60, 186, 20, DIM);
             if (screen == SCR_MENU) {
-                text("[H]  host a run", 60, 270, 30, TEXT);
-                text("[J]  join with a code", 60, 320, 30, TEXT);
-                text("[Esc] quit", 60, 370, 30, DIM);
+                text("[H]  host a run", 60, 250, 30, TEXT);
+                text("[P]  host a public run (listed: anyone can join)", 60, 295, 30, TEXT);
+                text("[L]  lobby list", 60, 340, 30, TEXT);
+                text("[J]  join with a code", 60, 385, 30, TEXT);
+                text("[Esc] quit", 60, 430, 30, DIM);
+            } else if (screen == SCR_LOBBY) {
+                text("public runs: press the number to join, Esc back", 60, 250, 22, DIM);
+                if (g && g->n_lobbies == 0) text(TextFormat("looking%.*s", (int)(t * 2) % 4, "..."), 60, 300, 28, TEXT);
+                for (int k = 0; g && k < g->n_lobbies; k++) {
+                    const Lobby *l = &g->lobbies[k];
+                    int full = l->players >= MAX_PLAYERS;
+                    text(TextFormat("[%d]  %s   %d/%d players   depth %d%s", k + 1, l->code, l->players, MAX_PLAYERS, l->depth,
+                                    full ? "   full" : ""),
+                         60, 300 + k * 40, 28, full ? DIM : TEXT);
+                }
             } else {
                 text("type the join code, Enter to join, Esc back", 60, 270, 22, DIM);
                 DrawRectangleLines(60, 310, 320, 56, TEXT);
                 text(TextFormat("%s_", code), 76, 320, 36, AMBER);
             }
-            text(err, 60, 450, 18, (Color){255, 120, 120, 255});
+            text(err, 60, 480, 18, (Color){255, 120, 120, 255});
+
             text(TextFormat("cosmos %s", cosmos_version()), 60, WIN_H - 40, 16, DIM);
         }
         EndDrawing();
