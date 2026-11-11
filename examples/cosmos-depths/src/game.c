@@ -602,7 +602,7 @@ static void on_event(Game *g, const uint8_t *d, size_t len) {
         g->kills_seen++;
         log_add(g, "%s slew the %s.", who(g, tag), MONSTER_KINDS[g->lv.mon[d[6]].type].name);
     } else if (d[1] == EVT_DEATH) {
-        int cause = d[6] < COUNT(MONSTER_KINDS) ? d[6] : -1;
+        int cause = len == 9 && d[6] < COUNT(MONSTER_KINDS) ? d[6] : -1; /* older builds sent the cause as text after byte 9 */
         if (s >= 0) g->pl[s].hp = 0;
         g->deaths_seen++;
         log_add(g, "%s fell to %s%s.", who(g, tag), cause >= 0 ? "a " : "", cause_name(cause));
