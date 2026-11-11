@@ -236,8 +236,8 @@ int selftest(void) {
 
 
 out:
-    game_free(fresh);
-    for (int i = N - 1; i >= 0; i--) game_free(g[i]);
+    game_free(fresh, 4);
+    for (int i = N - 1; i >= 0; i--) game_free(g[i], 4);
     printf(r ? "SELFTEST FAILED\n" : "SELFTEST OK\n");
     return r;
 }

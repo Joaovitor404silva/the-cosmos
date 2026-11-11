@@ -312,7 +312,7 @@ int main(int argc, char **argv) {
             for (int k = 0; k < g->n_lobbies; k++) if (IsKeyPressed(KEY_ONE + k)) pick = k;
             while (GetCharPressed()) {}
             if (pick >= 0 && g->lobbies[pick].players < MAX_PLAYERS) { game_join(g, g->lobbies[pick].code); screen = SCR_GAME; }
-            else if (IsKeyPressed(KEY_ESCAPE)) { game_free(g); g = NULL; screen = SCR_MENU; }
+            else if (IsKeyPressed(KEY_ESCAPE)) { game_free(g, 0.5); g = NULL; screen = SCR_MENU; }
         } else if (screen == SCR_CODE) {
             type_into(code, sizeof code, 1);
             if (IsKeyPressed(KEY_ESCAPE)) screen = SCR_MENU;
@@ -337,7 +337,7 @@ int main(int argc, char **argv) {
             }
             if (IsKeyPressed(KEY_ESCAPE) || (g->state >= ST_FAILED && IsKeyPressed(KEY_ENTER))) {
                 snprintf(err, sizeof err, "%s", g->status);
-                game_free(g); /* waits for a pending join (up to ~30 s) */
+                game_free(g, 0.5); /* a pending join finishes in the background */
                 g = NULL;
                 screen = SCR_MENU;
             }
@@ -408,7 +408,7 @@ int main(int argc, char **argv) {
             quit_at = t + 6; /* stay a moment so other windows can shoot us too */
         }
     }
-    game_free(g);
+    game_free(g, 4); /* app exit kills the reaper: give in-flight puts time */
     if (font.texture.id != GetFontDefault().texture.id) UnloadFont(font);
     CloseWindow();
     return 0;

@@ -818,14 +818,14 @@ static int game_reap(void *arg) {
 }
 
 /* A join or put can block for a while: if one is still running after a
- * short wait, a background thread finishes the shutdown so the window
+ * short wait (menus) a background thread finishes the shutdown so the window
  * never freezes and the node never lingers. */
-void game_free(Game *g) {
+void game_free(Game *g, double wait) {
     double until;
     int busy;
     if (!g) return;
     g->quitting = 1;
-    until = plat_now() + 0.5;
+    until = plat_now() + wait;
     do {
         Job *jobs[] = {&g->net, &g->put, &g->ghost_put, &g->lobby_put};
         busy = 0;

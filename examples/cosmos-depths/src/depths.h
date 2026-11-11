@@ -201,7 +201,7 @@ typedef struct Game {
 
 /* game.c */
 Game *game_new(const DepthsConfig *cfg, char *err, size_t cap);
-void game_free(Game *g);
+void game_free(Game *g, double wait); /* wait: seconds before a background thread takes over */
 void game_host(Game *g);
 void game_join(Game *g, const char *code);
 void game_browse(Game *g);                  /* fill g->lobbies with public runs */
