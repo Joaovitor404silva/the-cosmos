@@ -82,3 +82,8 @@ Early. Developed and tested on Windows (loopback, LAN, browsers); cross-network 
 many NAT types and the live two-account Steam relay test are still to do.
 Not audited for production use. The browser backend is not wire-compatible
 with native instances.
+
+## Licence
+
+MIT, see [LICENSE](LICENSE). Third-party parts keep their own licences
+(raylib zlib, JetBrains Mono OFL, Steamworks redistributable under Valve's terms).

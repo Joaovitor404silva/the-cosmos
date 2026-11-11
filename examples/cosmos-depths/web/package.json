@@ -1,6 +1,7 @@
 {
   "name": "cosmos-depths-web",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "bundle": "esbuild src/entry.js --bundle --format=iife --global-name=CosmosWeb --minify --outfile=build/cosmos-web.js",
