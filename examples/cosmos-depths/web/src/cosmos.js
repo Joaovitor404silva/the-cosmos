@@ -35,6 +35,7 @@ const PING_EVERY = 1000, LINK_DEAD = 10000;
 const QUERY_MAX = 256; // events kept per record query
 const ADVERT_SCAN = 64; // adverts read per relay per resolve round
 const RECORD_TTL_MAX = 1800; // as native (record.rs MAX_TTL)
+const CLOCK_SKEW = 120; // as native (record.rs): writers' clocks may run ahead
 const PENDING_FRAMES = 64, PENDING_BYTES = 512 << 10; // reliable frames held for a not-yet-announced peer
 const MAX_STRANGERS = 4; // inbound links not announced yet
 const SIGNAL_RATE = 20, SIGNAL_WINDOW = 10000; // per sender
@@ -95,9 +96,9 @@ const tagOf = (ev, name) => (Array.isArray(ev.tags) ? ev.tags.find((t) => Array.
 // a record event under the topic `d`, still live, with sane times
 function liveRecord(ev, d) {
   if (ev?.kind !== KIND_RECORD || tagOf(ev, 'd') !== d || typeof ev.content !== 'string') return null;
-  if (!Number.isSafeInteger(ev.created_at) || ev.created_at <= 0 || ev.created_at > now() + 60) return null;
+  if (!Number.isSafeInteger(ev.created_at) || ev.created_at <= 0 || ev.created_at > now() + CLOCK_SKEW) return null;
   const exp = Number(tagOf(ev, 'expiration'));
-  if (!Number.isSafeInteger(exp) || exp <= now() || exp > now() + RECORD_TTL_MAX) return null;
+  if (!Number.isSafeInteger(exp) || exp <= now() || exp > now() + RECORD_TTL_MAX + CLOCK_SKEW || exp > ev.created_at + RECORD_TTL_MAX) return null;
   return exp;
 }
 
