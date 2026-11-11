@@ -1,6 +1,6 @@
 // Live browser test of the built game (dist/cosmos-depths-web): a bot host
 // and a bot joiner in two isolated browser contexts, over the public relays.
-// Usage: node test/game.mjs OUTDIR   -> host.png, join.png, exit 0 when joined
+// Usage: [SITE_URL=https://...] node test/game.mjs OUTDIR   -> host.png, join.png
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -23,7 +23,7 @@ const server = http.createServer((req, res) => {
   fs.createReadStream(f).pipe(res);
 });
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
-const base = `http://127.0.0.1:${server.address().port}/`;
+const base = process.env.SITE_URL || `http://127.0.0.1:${server.address().port}/`; // SITE_URL: test the deployed site
 
 const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'cosmos-game-'));
 const browser = await puppeteer.launch({ executablePath: exe, headless: true, userDataDir: profile, args: ['--no-first-run', '--enable-unsafe-swiftshader'] });
