@@ -13,8 +13,12 @@ sessions, find both.
 - Run `cosmos-depths.exe`. Press **H** to host: the join code shows at the top.
 - Friends press **J**, type the code and press Enter. You can join mid-run.
 - **Arrows / WASD** step (bump a monster to attack), **Q E Z C** or the
-  numpad diagonals, **Space** on `>` to go down (everyone goes), **N** write
+  numpad diagonals, **Space** on `>` to go down (everyone goes), **N** leave
   a note on your tile, **Esc** leave.
+- Notes are built from three boxes of fixed words, as in souls-likes:
+  phrase (`____ ahead`, `beware of ____`, ...), word, ending. Left/Right pick
+  a box, Up/Down change it, Enter writes. No free text, so nobody can make
+  other players read their own words.
 - `@` players, `m` mire mote, `k` cinder kit, `W` deep warden, `!` glow
   tonic (+8 HP), `?` a note, `+` a grave. Stand next to a mark to read it.
 - When everyone has fallen, a new descent starts at depth 1. Fallen players
@@ -40,8 +44,10 @@ own `@` at once (prediction) and replay their unacknowledged intents over each
 snapshot. A late joiner gets `LEVEL` plus a reliable `SNAP`.
 
 Async plane, records (DHT), key `d<depth>` so any run of that depth sees them:
-`note` = room index, offset in the room, text; `grave` = the same with the
-cause of death. Room + offset places a mark on any map of that depth. One
+`note` = room index, offset in the room, then `1` and the three list indexes
+(phrase, word, ending); `grave` = the same spot, then `2` and the monster kind
+that killed (255: anything else). Only list indexes travel, never text, and a
+mark whose indexes are out of range is dropped. Room + offset places a mark on any map of that depth. One
 record per player and kind per depth (a new one replaces it); records live
 30 minutes (the SDK cap). Queried on every level enter and subscribed for live
 updates.

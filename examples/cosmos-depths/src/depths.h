@@ -197,7 +197,7 @@ typedef struct Game {
     double now, next_ghost;
     Mark put_mark; /* what the put worker is writing */
     int puts_done;
-    char grave_queue[NOTE_MAX + 1]; /* death mark waiting for the put worker */
+    int grave_pending, grave_cause; /* death mark waiting for the put worker */
     int grave_x, grave_y, grave_depth;
 } Game;
 
@@ -210,10 +210,17 @@ void game_browse(Game *g);                  /* fill g->lobbies with public runs 
 
 void game_update(Game *g, double now);
 int game_input(Game *g, int act);           /* queue an intent; 0 if full or dead */
-int game_put_note(Game *g, const char *text); /* at my spot; 0 if busy */
+/* Notes are picked from fixed lists, never typed: a record carries only
+ * the three list indexes, so nobody can make another player read their
+ * own words. pick = {phrase, word, ending}. */
+enum { NOTE_PHRASE, NOTE_WORD, NOTE_END, NOTE_BOXES };
+extern const char *const *const NOTE_LISTS[NOTE_BOXES];
+extern const int NOTE_LIST_LEN[NOTE_BOXES];
+int note_render(char *out, size_t cap, const uint8_t pick[NOTE_BOXES]); /* 0 if a pick is out of range */
+int game_put_note(Game *g, const uint8_t pick[NOTE_BOXES]); /* at my spot; 0 if busy */
 void game_watch_depth(Game *g, int depth);  /* query notes and graves, subscribe to them and ghosts */
 
-void game_hurt(Game *g, int slot, int dmg, const char *cause); /* host only */
+void game_hurt(Game *g, int slot, int dmg, int cause); /* host only; cause: monster kind or -1 */
 Player *game_me(Game *g);                   /* NULL until the host lists me */
 int game_slot_of(const Game *g, uint32_t tag);
 int game_monster_at(const Game *g, int x, int y);

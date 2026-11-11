@@ -136,7 +136,7 @@ static void draw_map(Game *g, double t) {
     }
 }
 
-static void draw_hud(Game *g, int typing, const char *note) {
+static void draw_hud(Game *g, const uint8_t *pick, int box) {
     Player *me = game_me(g);
     int x = MAP_X;
     const Mark *mk;
@@ -171,14 +171,36 @@ static void draw_hud(Game *g, int typing, const char *note) {
         DrawRectangleLines(WIN_W - MAP_X - w, LOG_Y, w, 28, mk->grave ? GRAVE_C : NOTE_C);
         text(s, WIN_W - MAP_X - w + 10, LOG_Y + 5, 18, mk->grave ? GRAVE_C : NOTE_C);
     }
-    if (typing) {
-        DrawRectangle(0, WIN_H - 26, WIN_W, 26, (Color){0, 0, 0, 230});
-        text(TextFormat("note: %s_   (Enter write, Esc cancel)", note), MAP_X, WIN_H - 23, 18, NOTE_C);
+    if (pick) { /* the note composer: three boxes filled from fixed lists */
+        char line[NOTE_MAX + 1];
+        int bx = MAP_X;
+        DrawRectangle(0, WIN_H - 64, WIN_W, 64, BG);
+        for (int i = 0; i < NOTE_BOXES; i++) {
+            const char *item = NOTE_LISTS[i][pick[i]];
+            const char *s = i == NOTE_PHRASE ? TextFormat(item, "____") : (item[0] ? item : "(none)");
+            const char *label = TextFormat("%s %s %s", i == box ? "<" : " ", s, i == box ? ">" : " ");
+            int w = (int)MeasureTextEx(font, label, 18, 0).x + 16;
+            DrawRectangleLines(bx, WIN_H - 60, w, 26, i == box ? AMBER : DIM);
+            text(label, bx + 8, WIN_H - 56, 18, i == box ? AMBER : TEXT);
+            bx += w + 10;
+        }
+        note_render(line, sizeof line, pick);
+        text(TextFormat("\"%s\"   left/right box, up/down change, Enter write, Esc cancel", line), MAP_X, WIN_H - 26, 17, NOTE_C);
     } else if (me && me->hp <= 0) {
         text("You have fallen. Your grave stays here for later runs. Watching the others.", MAP_X, WIN_H - 23, 18, (Color){255, 120, 120, 255});
     } else {
         text("arrows/WASD move + bump attack   Q E Z C diagonals   Space on > descend   N note   Esc leave", MAP_X, WIN_H - 23, 16, DIM);
     }
+}
+
+/* Note composer keys: left/right pick a box, up/down cycle its list. */
+static void compose_note(uint8_t pick[NOTE_BOXES], int *box) {
+    int n;
+    if (IsKeyPressed(KEY_LEFT) || IsKeyPressed(KEY_A)) *box = (*box + NOTE_BOXES - 1) % NOTE_BOXES;
+    if (IsKeyPressed(KEY_RIGHT) || IsKeyPressed(KEY_D)) *box = (*box + 1) % NOTE_BOXES;
+    n = NOTE_LIST_LEN[*box];
+    if (IsKeyPressed(KEY_UP) || IsKeyPressedRepeat(KEY_UP) || IsKeyPressed(KEY_W)) pick[*box] = (uint8_t)((pick[*box] + n - 1) % n);
+    if (IsKeyPressed(KEY_DOWN) || IsKeyPressedRepeat(KEY_DOWN) || IsKeyPressed(KEY_S)) pick[*box] = (uint8_t)((pick[*box] + 1) % n);
 }
 
 /* Append typed printable characters to `buf`; Backspace deletes. */
@@ -256,7 +278,9 @@ static int bot_action(Game *g) {
 
 int main(int argc, char **argv) {
     DepthsConfig cfg;
-    char path[300], code[COSMOS_CODE_MAX] = "", note[NOTE_MAX + 1] = "", err[256] = "", shot[300] = "", join_file[300] = "";
+    char path[300], code[COSMOS_CODE_MAX] = "", err[256] = "", shot[300] = "", join_file[300] = "";
+    uint8_t note[NOTE_BOXES] = {0, 26, 0}; /* "The dark ahead" */
+    int box = 0;
     int screen = SCR_MENU, typing = 0, bot = 0, host_now = 0, public_now = 0, browse_now = 0, wx = -1, wy = -1;
     double shot_after = 8, played = 0, next_step = 0, quit_at = 0;
     Game *g = NULL;
@@ -274,6 +298,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--public")) public_now = 1;
         else if (!strcmp(a, "--browse")) browse_now = 1;
         else if (!strcmp(a, "--bot")) bot = cfg.test = 1;
+        else if (!strcmp(a, "--test")) cfg.test = 1; /* own namespace, no bot */
         else if (!strcmp(a, "--join") && *v == '@') { snprintf(join_file, sizeof join_file, "%s", v + 1); i++; }
         else if (!strcmp(a, "--join") && *v) { snprintf(code, sizeof code, "%s", v); i++; }
         else if (!strcmp(a, "--window") && *v) { sscanf(v, "%d,%d", &wx, &wy); i++; }
@@ -338,9 +363,9 @@ int main(int argc, char **argv) {
             if (IsKeyPressed(KEY_ENTER) && code[0] && (g = game_new(&cfg, err, sizeof err))) { game_join(g, code); screen = SCR_GAME; }
             else if (IsKeyPressed(KEY_ENTER)) screen = SCR_MENU;
         } else if (typing) {
-            type_into(note, sizeof note, 0);
+            compose_note(note, &box);
             if (IsKeyPressed(KEY_ESCAPE)) typing = 0;
-            if (IsKeyPressed(KEY_ENTER)) { if (note[0]) game_put_note(g, note); typing = 0; }
+            if (IsKeyPressed(KEY_ENTER)) { game_put_note(g, note); typing = 0; }
         } else {
             /* A press acts at once; holding repeats at the tick rate. */
             int act = read_action(1);
@@ -351,8 +376,6 @@ int main(int argc, char **argv) {
             if (act >= 0 && g->n_pend < 3) game_input(g, act);
             if (IsKeyPressed(KEY_N) && g->state == ST_PLAYING && game_me(g)) {
                 typing = 1;
-                note[0] = 0;
-                while (GetCharPressed()) {} /* drop the N keystroke */
             }
             if (IsKeyPressed(KEY_ESCAPE) || (g->state >= ST_FAILED && IsKeyPressed(KEY_ENTER))) {
                 snprintf(err, sizeof err, "%s", g->status);
@@ -376,7 +399,7 @@ int main(int argc, char **argv) {
         if (g && g->state == ST_PLAYING && game_me(g)) {
             if (played == 0 && g->is_host) printf("join code %s\n", g->code); /* for scripts */
             if (bot && played < 3 && played + GetFrameTime() >= 3)
-                game_put_note(g, TextFormat("P%d was here. Mind the dark.", game_slot_of(g, g->my_tag) + 1));
+                game_put_note(g, (const uint8_t[NOTE_BOXES]){0, 5, 1}); /* "The stairs ahead!" */
             played += GetFrameTime();
         }
         if (screen == SCR_LOBBY) played += GetFrameTime(); /* --shot of the list */
@@ -385,7 +408,7 @@ int main(int argc, char **argv) {
         ClearBackground(BG);
         if (screen == SCR_GAME && g) {
             if (g->have_level) draw_map(g, t);
-            draw_hud(g, typing, note);
+            draw_hud(g, typing ? note : NULL, box);
         } else {
             text("COSMOS DEPTHS", 60, 110, 64, AMBER);
             text("a co-op descent for 1-4 players. Notes and graves outlive the run.", 60, 186, 20, DIM);

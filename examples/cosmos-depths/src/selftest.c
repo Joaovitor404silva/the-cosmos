@@ -8,8 +8,9 @@
 #include "depths.h"
 
 #define N 4
-#define NOTE_TEXT "selftest note: mind the gaunt"
-#define CAUSE "a selftest trap"
+#define NOTE_TEXT "Beware of a deep warden, trust me"
+static const uint8_t NOTE_PICK[NOTE_BOXES] = {2, 2, 4};
+#define CAUSE "slain by the dark"
 
 static Game *g[N], *fresh;
 static int kill_id;
@@ -207,7 +208,7 @@ int selftest(void) {
     if (!wait_for(late_joiner_synced, 70)) { fail("late join"); goto out; }
     printf("ok: late 4th player got the seed, the dead monster and every position\n");
 
-    if (!game_put_note(g[1], NOTE_TEXT)) { fail("note put start"); goto out; }
+    if (!game_put_note(g[1], NOTE_PICK)) { fail("note put start"); goto out; }
     if (!wait_for(put1_done, 40) || g[1]->put.result != COSMOS_OK) { fail("note put"); goto out; }
     if (!wait_for(note_live, 20)) { fail("note subscription"); goto out; }
     printf("ok: note put by player 1, live on player 2 via subscription\n");
@@ -216,7 +217,7 @@ int selftest(void) {
     if (!fresh_finds(note_fresh)) { fail("note query"); goto out; }
     printf("ok: note queried back by a fresh instance\n");
 
-    game_hurt(g[0], game_slot_of(g[0], g[3]->my_tag), 999, CAUSE);
+    game_hurt(g[0], game_slot_of(g[0], g[3]->my_tag), 999, -1);
     if (!wait_for(three_dead, 10)) { fail("death event"); goto out; }
     if (!wait_for(put3_done, 40) || g[3]->put.result != COSMOS_OK) { fail("grave put"); goto out; }
     if (!fresh_finds(grave_fresh)) { fail("grave query"); goto out; }

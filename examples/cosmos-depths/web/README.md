@@ -24,4 +24,4 @@ headers threads need).
     npm test                     # 5 backend instances on the live relays
     node test\game.mjs OUTDIR    # built game: bot host + bot joiner, screenshots
 
-URL flags: `?host`, `?public`, `?browse`, `?join=CODE`, `?bot`.
+URL flags: `?host`, `?public`, `?browse`, `?join=CODE`, `?bot`, `?test` (bot and test runs use their own namespace).

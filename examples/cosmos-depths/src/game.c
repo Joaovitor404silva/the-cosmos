@@ -15,8 +15,10 @@
  * a HELLO tag already in use. Depth goes on the wire as u16.
  *
  * Async plane (records under key "d<depth>", so any run reaches them):
- *   "note"  [room, dx, dy, text]   a player's note on a floor tile
- *   "grave" [room, dx, dy, cause]  where and how a player died
+ *   "note"  [room, dx, dy, 1, phrase, word, ending]  a note picked from
+ *                                  the fixed lists (no free text)
+ *   "grave" [room, dx, dy, 2, cause]  where a player died; cause is a
+ *                                  monster kind, 255 for anything else
  *   "lobby" [players, depth u16, code]  under key "open": a public run's
  *                                  listing, put every 20 s by its host
  *                                  while it opts in. Anyone can read the
@@ -68,12 +70,6 @@ static void copy_str(char *dst, size_t cap, const char *src) {
     dst[n] = 0;
 }
 
-/* Printable ASCII only: records and events come from other players. */
-static void copy_text(char *dst, size_t cap, const uint8_t *src, size_t len) {
-    size_t n = len < cap - 1 ? len : cap - 1;
-    for (size_t i = 0; i < n; i++) dst[i] = (src[i] >= 32 && src[i] < 127) ? (char)src[i] : '?';
-    dst[n] = 0;
-}
 
 static void log_add(Game *g, const char *fmt, ...) {
     va_list ap;
@@ -245,6 +241,46 @@ static void send_hello(Game *g, uint32_t to) {
 
 /* ---- async plane: notes and graves ---- */
 
+static const char *const PHRASES[] = {
+    "%s ahead", "no %s here", "beware of %s", "try %s", "is this %s", "I wish for %s",
+    "remember %s", "%s saved me", "%s killed me", "follow %s", "%s below", "behold, %s", "%s",
+};
+static const char *const WORDS[] = {
+    "a mire mote", "a cinder kit", "a deep warden", "a monster", "a tonic", "the stairs", "a grave", "a note",
+    "a dead end", "a shortcut", "a trap", "treasure", "a friend", "the host", "a stranger", "running",
+    "fighting", "waiting", "going back", "haste", "caution", "patience", "hope", "fear",
+    "despair", "joy", "the dark", "light", "left", "right", "up", "down",
+};
+static const char *const ENDS[] = {"", "!", "?", "...", ", trust me", ", maybe", ", hurry", ", good luck", ", together"};
+#define COUNT(a) ((int)(sizeof a / sizeof a[0]))
+const char *const *const NOTE_LISTS[NOTE_BOXES] = {PHRASES, WORDS, ENDS};
+const int NOTE_LIST_LEN[NOTE_BOXES] = {COUNT(PHRASES), COUNT(WORDS), COUNT(ENDS)};
+enum { MARK_NOTE = 1, MARK_GRAVE = 2, CAUSE_DARK = 255 };
+
+int note_render(char *out, size_t cap, const uint8_t pick[NOTE_BOXES]) {
+    char s[NOTE_MAX + 1];
+    for (int i = 0; i < NOTE_BOXES; i++)
+        if (pick[i] >= NOTE_LIST_LEN[i]) return 0;
+    snprintf(s, sizeof s, PHRASES[pick[0]], WORDS[pick[1]]);
+    s[0] = (char)toupper((unsigned char)s[0]);
+    snprintf(out, cap, "%s%s", s, ENDS[pick[2]]);
+    return 1;
+}
+
+static const char *cause_name(int cause) {
+    return cause >= 0 && cause < COUNT(MONSTER_KINDS) ? MONSTER_KINDS[cause].name : "the dark";
+}
+
+/* A mark's body (after the spot bytes) -> its text, or 0 if malformed. */
+static int mark_text(char *out, size_t cap, int grave, const uint8_t *b, size_t n, int depth) {
+    if (grave) {
+        if (n != 2 || b[0] != MARK_GRAVE || (b[1] >= COUNT(MONSTER_KINDS) && b[1] != CAUSE_DARK)) return 0;
+        snprintf(out, cap, "slain by %s%s at depth %d", b[1] == CAUSE_DARK ? "" : "a ", cause_name(b[1] == CAUSE_DARK ? -1 : b[1]), depth);
+        return 1;
+    }
+    return n == 1 + NOTE_BOXES && b[0] == MARK_NOTE && note_render(out, cap, b + 1);
+}
+
 /* Room index + offset -> a tile on this map, or -1 if not this depth. */
 static void place_spot(const Game *g, int depth, int room, int dx, int dy, int *x, int *y) {
     const Room *r;
@@ -331,6 +367,7 @@ static void on_record(Game *g, const cosmos_event_t *ev) {
     char key[16];
     int grave;
     Mark *m;
+    char body[NOTE_MAX + 1];
     if (ev->error != COSMOS_OK || !ev->data || !ev->record_kind || !ev->record_key || ev->len < 4 ||
         ev->len > 3 + NOTE_MAX || ev->publisher_len > COSMOS_PEER_ID_MAX)
         return;
@@ -347,6 +384,7 @@ static void on_record(Game *g, const cosmos_event_t *ev) {
     if (!strcmp(ev->record_kind, "note")) grave = 0;
     else if (!strcmp(ev->record_kind, "grave")) grave = 1;
     else return;
+    if (!mark_text(body, sizeof body, grave, ev->data + 3, ev->len - 3, g->marks_depth)) return; /* not from the lists */
     m = mark_slot(g, grave, ev->publisher, ev->publisher_len);
     memset(m, 0, sizeof *m);
     m->grave = grave;
@@ -356,7 +394,7 @@ static void on_record(Game *g, const cosmos_event_t *ev) {
     m->room = ev->data[0];
     m->dx = ev->data[1];
     m->dy = ev->data[2];
-    copy_text(m->text, sizeof m->text, ev->data + 3, ev->len - 3);
+    copy_str(m->text, sizeof m->text, body);
     place_mark(g, m);
 }
 
@@ -380,23 +418,21 @@ void game_watch_depth(Game *g, int depth) {
 }
 
 /* Record payload for a mark at my spot: [room, dx, dy, text]. */
-static int start_put(Game *g, const char *kind, int x, int y, int depth, const char *text) {
+static int start_put(Game *g, const char *kind, int x, int y, int depth, const uint8_t *body, size_t n) {
     Job *j = &g->put;
     Mark *m = &g->put_mark;
-    size_t n = strlen(text);
-    if (j->thread || n == 0 || !g->have_level) return 0;
-    if (n > NOTE_MAX) n = NOTE_MAX;
+    if (j->thread || !g->have_level) return 0;
     memset(m, 0, sizeof *m);
     m->grave = !strcmp(kind, "grave");
+    if (!mark_text(m->text, sizeof m->text, m->grave, body, n, depth)) return 0;
     m->depth = depth;
     spot_bytes(g, x, y, j->data);
     m->room = j->data[0];
     m->dx = j->data[1];
     m->dy = j->data[2];
-    memcpy(m->text, text, n);
     memcpy(m->pub, g->my_id, g->my_id_len);
     m->pub_len = g->my_id_len;
-    memcpy(j->data + 3, text, n);
+    memcpy(j->data + 3, body, n);
     j->len = 3 + n;
     j->ttl = RECORD_TTL;
     copy_str(j->kind, sizeof j->kind, kind);
@@ -404,9 +440,10 @@ static int start_put(Game *g, const char *kind, int x, int y, int depth, const c
     return job_start(g, j, JOB_PUT);
 }
 
-int game_put_note(Game *g, const char *text) {
+int game_put_note(Game *g, const uint8_t pick[NOTE_BOXES]) {
     Player *me = game_me(g);
-    if (!me || !start_put(g, "note", g->me_x, g->me_y, g->lv.depth, text)) return 0;
+    uint8_t body[1 + NOTE_BOXES] = {MARK_NOTE, pick[0], pick[1], pick[2]};
+    if (!me || !start_put(g, "note", g->me_x, g->me_y, g->lv.depth, body, sizeof body)) return 0;
     copy_str(g->status, sizeof g->status, "writing the note...");
     return 1;
 }
@@ -565,13 +602,13 @@ static void on_event(Game *g, const uint8_t *d, size_t len) {
         g->kills_seen++;
         log_add(g, "%s slew the %s.", who(g, tag), MONSTER_KINDS[g->lv.mon[d[6]].type].name);
     } else if (d[1] == EVT_DEATH) {
-        char cause[CAUSE_MAX + 1];
-        copy_text(cause, sizeof cause, d + 9, len - 9);
+        int cause = d[6] < COUNT(MONSTER_KINDS) ? d[6] : -1;
         if (s >= 0) g->pl[s].hp = 0;
         g->deaths_seen++;
-        log_add(g, "%s fell to %s.", who(g, tag), cause);
+        log_add(g, "%s fell to %s%s.", who(g, tag), cause >= 0 ? "a " : "", cause_name(cause));
         if (tag == g->my_tag) { /* leave a death mark for later runs */
-            snprintf(g->grave_queue, sizeof g->grave_queue, "slain by %s at depth %d", cause, g->lv.depth);
+            g->grave_pending = 1;
+            g->grave_cause = cause >= 0 ? cause : CAUSE_DARK;
             g->grave_x = d[7];
             g->grave_y = d[8];
             g->grave_depth = g->lv.depth;
@@ -641,7 +678,7 @@ static Player *host_add_player(Game *g, uint32_t peer, uint32_t tag) {
     return p;
 }
 
-void game_hurt(Game *g, int slot, int dmg, const char *cause) {
+void game_hurt(Game *g, int slot, int dmg, int cause) {
     Player *p;
     if (!g->is_host || slot < 0 || slot >= MAX_PLAYERS) return;
     p = &g->pl[slot];
@@ -649,7 +686,7 @@ void game_hurt(Game *g, int slot, int dmg, const char *cause) {
     p->hp -= dmg;
     if (p->hp <= 0) {
         p->hp = 0;
-        send_event(g, EVT_DEATH, p->tag, 0, p->x, p->y, cause);
+        send_event(g, EVT_DEATH, p->tag, cause >= 0 && cause < COUNT(MONSTER_KINDS) ? cause : CAUSE_DARK, p->x, p->y, NULL);
     }
 }
 
@@ -700,9 +737,7 @@ static void monster_turn(Game *g, int id) {
     }
     if (best < 0) return;
     if (bd <= 1) {
-        char cause[CAUSE_MAX + 1];
-        snprintf(cause, sizeof cause, "a %s", k->name);
-        game_hurt(g, best, k->dmg, cause);
+        game_hurt(g, best, k->dmg, m->type);
         return;
     }
     {
@@ -976,10 +1011,11 @@ static void collect_jobs(Game *g) {
             copy_str(g->status, sizeof g->status, g->put_mark.grave ? "your death mark is left behind" : "note placed");
         }
     }
-    if (g->grave_queue[0] && !g->put.thread && g->have_level) {
+    if (g->grave_pending && !g->put.thread && g->have_level) {
         int depth = g->lv.depth;
-        if (g->grave_depth == depth && start_put(g, "grave", g->grave_x, g->grave_y, depth, g->grave_queue)) g->grave_queue[0] = 0;
-        else if (g->grave_depth != depth) g->grave_queue[0] = 0; /* the level is gone */
+        uint8_t body[2] = {MARK_GRAVE, (uint8_t)g->grave_cause};
+        if (g->grave_depth == depth && start_put(g, "grave", g->grave_x, g->grave_y, depth, body, sizeof body)) g->grave_pending = 0;
+        else if (g->grave_depth != depth) g->grave_pending = 0; /* the level is gone */
     }
 }
 

@@ -36,7 +36,7 @@
   <div class="keys">
     <div><b>H</b> host &nbsp; <b>P</b> public host &nbsp; <b>L</b> lobby &nbsp; <b>J</b> join</div>
     <div><b>arrows / WASD</b> move and attack &nbsp; <b>Q E Z C</b> diagonals</div>
-    <div><b>Space</b> descend on &gt; &nbsp; <b>N</b> write a note &nbsp; <b>Esc</b> leave</div>
+    <div><b>Space</b> descend on &gt; &nbsp; <b>N</b> leave a note &nbsp; <b>Esc</b> leave</div>
   </div>
   <footer>
     No game server: players meet through public <a href="https://nostr.com" rel="noopener">Nostr</a> relays and play over direct WebRTC
@@ -50,9 +50,12 @@
   const canvas = document.getElementById('canvas');
   const q = new URLSearchParams(location.search);
   const args = [];
-  for (const f of ['host', 'public', 'browse', 'bot']) if (q.has(f)) args.push('--' + f);
+  for (const f of ['host', 'public', 'browse', 'bot', 'test']) if (q.has(f)) args.push('--' + f);
   if (q.get('join')) args.push('--join', q.get('join'));
   canvas.addEventListener('click', () => canvas.focus());
+  // game keys must not scroll the page under the player
+  const GAME_KEYS = new Set(['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' ', 'PageUp', 'PageDown', 'Home', 'End']);
+  window.addEventListener('keydown', (e) => { if (GAME_KEYS.has(e.key)) e.preventDefault(); }, { passive: false });
   var Module = {
     canvas,
     arguments: args,
