@@ -1,0 +1,297 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
+<title>The Cosmos Map</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;600&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column; a layered stack diagram, then the join sequence, then the privacy table. */
+:root {
+  --bg: #f4f5fa; --panel: #ffffff; --fg: #171a2b; --muted: #5d6280; --line: #d5d8e8;
+  --accent: #5b4bd6; --sync: #0e8f7a; --async: #b8650a; --relay: #2f6fd1; --lock: #9b2f5c;
+  --display: "Space Grotesk", "Segoe UI", system-ui, sans-serif;
+  --body: "Inter", "Segoe UI", system-ui, sans-serif;
+  --mono: "JetBrains Mono", Consolas, ui-monospace, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #0d0f1a; --panel: #151829; --fg: #e6e8f5; --muted: #9499b8; --line: #2a2e48;
+  --accent: #9d90ff; --sync: #3fd1b6; --async: #f0a548; --relay: #6fa4ff; --lock: #e57aa6; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #0d0f1a; --panel: #151829; --fg: #e6e8f5; --muted: #9499b8; --line: #2a2e48;
+  --accent: #9d90ff; --sync: #3fd1b6; --async: #f0a548; --relay: #6fa4ff; --lock: #e57aa6; color-scheme: dark }
+body { background: var(--bg); color: var(--fg); font: 15px/1.6 var(--body); }
+main { max-width: 980px; margin: 0 auto; padding-block: 40px 64px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  display: grid; gap: 48px; }
+h1, h2 { font-family: var(--display); text-wrap: balance; margin: 0; letter-spacing: -0.01em; }
+h1 { font-size: clamp(30px, 5vw, 44px); }
+h2 { font-size: 22px; }
+p { margin: 0; max-width: 68ch; color: var(--muted); }
+header { display: grid; gap: 10px; }
+.eyebrow { font: 600 12px var(--mono); letter-spacing: .12em; text-transform: uppercase; color: var(--accent); }
+section { display: grid; gap: 16px; }
+.scroll { overflow-x: auto; }
+svg { display: block; min-width: 760px; width: 100%; height: auto; }
+svg text { font-family: var(--body); fill: var(--fg); }
+svg .mono { font-family: var(--mono); }
+svg .muted { fill: var(--muted); }
+.legend { display: flex; flex-wrap: wrap; gap: 8px 20px; font-size: 13px; color: var(--muted); }
+.legend span { display: inline-flex; align-items: center; gap: 8px; }
+.legend i { width: 22px; height: 0; border-top: 3px solid; display: inline-block; }
+table { border-collapse: collapse; width: 100%; min-width: 640px; font-size: 14px; }
+th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font: 600 12px var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+td:first-child { font-weight: 600; white-space: nowrap; }
+.who { font-family: var(--mono); font-size: 13px; }
+.pill { font: 600 11px var(--mono); padding: 2px 8px; border-radius: 99px; border: 1px solid currentColor; white-space: nowrap; }
+.pill.open { color: var(--sync); } .pill.code { color: var(--lock); }
+code { font-family: var(--mono); font-size: 13px; }
+</style>
+
+<main>
+  <header>
+    <div class="eyebrow">The Cosmos SDK · architecture</div>
+    <h1>How a game talks through The Cosmos</h1>
+    <p>No game server and no Cosmos relay. Players reach each other directly over libp2p, fall back to Steam's relay when direct fails, and keep slow, lasting data (notes, graves, session listings) in a shared DHT.</p>
+  </header>
+
+  <section>
+    <h2>The stack</h2>
+    <p>One <code>cosmos.dll</code> per game. Fast traffic goes over a path; async data goes into the DHT.</p>
+    <div class="scroll">
+    <svg viewBox="0 0 960 560" role="img" aria-label="Layered architecture: game, C API, core, then direct path, Steam path and DHT">
+      <defs>
+        <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker>
+      </defs>
+      <!-- game -->
+      <rect x="20" y="16" width="920" height="70" rx="10" fill="var(--panel)" stroke="var(--line)"/>
+      <text x="40" y="46" font-weight="700" font-size="17">Game</text>
+      <text x="40" y="70" class="muted" font-size="13">Cosmos Depths (C + raylib) · host predicts, others send intents · notes and graves</text>
+      <text x="920" y="46" text-anchor="end" class="mono muted" font-size="12">cosmos_host · cosmos_join · cosmos_send · cosmos_poll</text>
+
+      <line x1="480" y1="86" x2="480" y2="112" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#ah)"/>
+
+      <!-- ffi -->
+      <rect x="20" y="114" width="920" height="56" rx="10" fill="var(--panel)" stroke="var(--line)"/>
+      <text x="40" y="148" font-weight="700" font-size="16">cosmos-ffi</text>
+      <text x="170" y="148" class="muted" font-size="13">C ABI, poll-based event queue, identity key file, Steam on/off, session key hand-off</text>
+
+      <line x1="480" y1="170" x2="480" y2="196" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#ah)"/>
+
+      <!-- core -->
+      <rect x="20" y="198" width="920" height="118" rx="10" fill="var(--panel)" stroke="var(--accent)" stroke-width="1.5"/>
+      <text x="40" y="226" font-weight="700" font-size="16">cosmos-core</text>
+      <g font-size="13">
+        <rect x="40" y="240" width="200" height="60" rx="8" fill="none" stroke="var(--line)"/>
+        <text x="54" y="264" font-weight="600">Session</text>
+        <text x="54" y="286" class="muted">host + up to 3, join secret</text>
+        <rect x="256" y="240" width="200" height="60" rx="8" fill="none" stroke="var(--line)"/>
+        <text x="270" y="264" font-weight="600">PathSet</text>
+        <text x="270" y="286" class="muted">direct first, Steam fallback</text>
+        <rect x="472" y="240" width="210" height="60" rx="8" fill="none" stroke="var(--lock)"/>
+        <text x="486" y="264" font-weight="600">Join codes</text>
+        <text x="486" y="286" class="muted">Argon2id → encrypted listing</text>
+        <rect x="698" y="240" width="222" height="60" rx="8" fill="none" stroke="var(--line)"/>
+        <text x="712" y="264" font-weight="600">Records</text>
+        <text x="712" y="286" class="muted">signed, cached on disk</text>
+      </g>
+
+      <!-- arrows to bottom -->
+      <path d="M356 300 V 380" stroke="var(--sync)" stroke-width="3" fill="none" marker-end="url(#ah)"/>
+      <path d="M356 340 H 140 V 380" stroke="var(--sync)" stroke-width="3" fill="none" marker-end="url(#ah)"/>
+      <path d="M356 340 H 470 V 380" stroke="var(--relay)" stroke-width="3" fill="none" stroke-dasharray="7 5" marker-end="url(#ah)"/>
+      <path d="M577 300 V 340 H 760 V 380" stroke="var(--async)" stroke-width="3" fill="none" marker-end="url(#ah)"/>
+      <path d="M809 300 V 380" stroke="var(--async)" stroke-width="3" fill="none" marker-end="url(#ah)"/>
+
+      <!-- transports -->
+      <rect x="20" y="384" width="390" height="150" rx="10" fill="var(--panel)" stroke="var(--sync)" stroke-width="1.5"/>
+      <text x="40" y="412" font-weight="700" font-size="16">Direct (cosmos-net)</text>
+      <g font-size="13" class="muted">
+        <text x="40" y="438" class="muted">libp2p QUIC + TCP, Noise/TLS encrypted</text>
+        <text x="40" y="460" class="muted">hole punching; LAN + UPnP only when LAN is on</text>
+        <text x="40" y="482" class="muted">public addresses only (LAN/VPN with LAN on)</text>
+        <text x="40" y="504" class="muted">dial hints from peers are scope filtered</text>
+      </g>
+
+      <rect x="426" y="384" width="230" height="150" rx="10" fill="var(--panel)" stroke="var(--relay)" stroke-width="1.5" stroke-dasharray="7 5"/>
+      <text x="446" y="412" font-weight="700" font-size="16">Steam relay (SDR)</text>
+      <g font-size="13">
+        <text x="446" y="438" class="muted">until direct is up</text>
+        <text x="446" y="460" class="muted">HELLO needs session tag</text>
+        <text x="446" y="482" class="muted">signed key ↔ SteamID bind</text>
+        <text x="446" y="504" class="muted">AppID set by the game</text>
+      </g>
+
+      <rect x="672" y="384" width="268" height="150" rx="10" fill="var(--panel)" stroke="var(--async)" stroke-width="1.5"/>
+      <text x="692" y="412" font-weight="700" font-size="16">DHT (Kademlia + gossip)</text>
+      <g font-size="13">
+        <text x="692" y="438" class="muted">session listing (encrypted)</text>
+        <text x="692" y="460" class="muted">SteamID record (encrypted)</text>
+        <text x="692" y="482" class="muted">notes, graves (signed, public)</text>
+        <text x="692" y="504" class="muted">address records for punching</text>
+      </g>
+    </svg>
+    </div>
+    <div class="legend">
+      <span><i style="border-color:var(--sync)"></i>real-time path, direct</span>
+      <span><i style="border-color:var(--relay);border-top-style:dashed"></i>real-time path, Steam fallback</span>
+      <span><i style="border-color:var(--async)"></i>async data</span>
+    </div>
+  </section>
+
+  <section>
+    <h2>Joining with a code</h2>
+    <p>The code is the only secret. The listing is locked with keys that come from the code and the current UTC day, so the people storing it can't read it, and a code-to-topic lookup table goes stale every day. The join secret and session key are random per session and travel inside the locked listing.</p>
+    <div class="scroll">
+    <svg viewBox="0 0 960 520" role="img" aria-label="Join sequence between host, DHT and joiner">
+      <defs>
+        <marker id="ah2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--fg)"/></marker>
+      </defs>
+      <g font-weight="700" font-size="15" text-anchor="middle">
+        <rect x="70" y="10" width="160" height="40" rx="8" fill="var(--panel)" stroke="var(--line)"/><text x="150" y="36">Host</text>
+        <rect x="400" y="10" width="160" height="40" rx="8" fill="var(--panel)" stroke="var(--async)"/><text x="480" y="36">DHT nodes</text>
+        <rect x="730" y="10" width="160" height="40" rx="8" fill="var(--panel)" stroke="var(--line)"/><text x="810" y="36">Joiner</text>
+      </g>
+      <g stroke="var(--line)" stroke-width="2" stroke-dasharray="3 5">
+        <line x1="150" y1="50" x2="150" y2="510"/><line x1="480" y1="50" x2="480" y2="510"/><line x1="810" y1="50" x2="810" y2="510"/>
+      </g>
+
+      <g font-size="13">
+        <!-- 1 -->
+        <rect x="20" y="70" width="260" height="58" rx="8" fill="var(--panel)" stroke="var(--lock)"/>
+        <text x="34" y="94" font-weight="600">1 · make the code</text>
+        <text x="34" y="116" class="mono muted" font-size="12">secret salt → Argon2id → 7K3Q-M9XA</text>
+
+        <!-- 2 -->
+        <line x1="150" y1="160" x2="474" y2="160" stroke="var(--fg)" stroke-width="1.5" marker-end="url(#ah2)"/>
+        <text x="312" y="150" text-anchor="middle" font-weight="600">2 · publish locked listing</text>
+        <text x="312" y="180" text-anchor="middle" class="muted">opaque topics for yesterday, today, tomorrow</text>
+        <text x="312" y="198" text-anchor="middle" class="muted">sealed: host, addresses, salt, join secret, session key</text>
+
+        <!-- 3 -->
+        <text x="810" y="222" text-anchor="middle" font-weight="600">3 · player types the code</text>
+        <text x="810" y="242" text-anchor="middle" class="mono muted" font-size="12">Argon2id(code, today) → topic, key</text>
+
+        <!-- 4 -->
+        <line x1="804" y1="280" x2="486" y2="280" stroke="var(--fg)" stroke-width="1.5" marker-end="url(#ah2)"/>
+        <text x="645" y="270" text-anchor="middle" font-weight="600">4 · look up the topic</text>
+        <line x1="486" y1="310" x2="804" y2="310" stroke="var(--fg)" stroke-width="1.5" marker-end="url(#ah2)"/>
+        <text x="645" y="300" text-anchor="middle" class="muted">listing comes back sealed</text>
+        <text x="645" y="332" text-anchor="middle" class="muted">unlock it, check the code derives from the host key, read the secret</text>
+
+        <!-- 5 -->
+        <line x1="804" y1="380" x2="156" y2="380" stroke="var(--sync)" stroke-width="3" marker-end="url(#ah2)"/>
+        <text x="480" y="370" text-anchor="middle" font-weight="600">5 · connect directly (or over Steam) and show the join secret</text>
+
+        <!-- 6 -->
+        <line x1="156" y1="430" x2="804" y2="430" stroke="var(--sync)" stroke-width="3" marker-end="url(#ah2)"/>
+        <text x="480" y="420" text-anchor="middle" font-weight="600">6 · welcome: member list, game starts</text>
+
+        <!-- 7 -->
+        <text x="480" y="476" text-anchor="middle" class="muted">7 · each member publishes its SteamID, sealed with the session key</text>
+        <text x="480" y="498" text-anchor="middle" class="muted">so members find each other on Steam and strangers never do</text>
+      </g>
+    </svg>
+    </div>
+  </section>
+
+  <section>
+    <h2>The DHT and the gossip mesh</h2>
+    <p>Every record put goes out two ways at once. The Kademlia DHT stores it, so a player who arrives later can still look it up. The gossip mesh pushes it live to the players who are watching that topic right now, such as everyone on the same dungeon level when a note, grave or ghost appears, or everyone browsing the lobby list when a public run updates its listing.</p>
+    <div class="scroll">
+    <svg viewBox="0 0 960 420" role="img" aria-label="A record put goes to the Kademlia DHT for storage and to the gossip mesh for live delivery; every copy is checked before the game sees it">
+      <defs>
+        <marker id="ah3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker>
+      </defs>
+      <!-- publisher -->
+      <rect x="20" y="170" width="170" height="80" rx="10" fill="var(--panel)" stroke="var(--line)"/>
+      <text x="36" y="198" font-weight="700" font-size="15">Player puts a note</text>
+      <text x="36" y="220" class="mono muted" font-size="11">cosmos_record_put</text>
+      <text x="36" y="238" class="muted" font-size="12">signed with its key</text>
+      <path d="M190 195 C 210 195, 210 90, 228 90" stroke="var(--async)" stroke-width="3" fill="none" marker-end="url(#ah3)"/>
+      <path d="M190 225 C 210 225, 210 300, 228 300" stroke="var(--accent)" stroke-width="3" fill="none" marker-end="url(#ah3)"/>
+
+      <!-- kademlia lane -->
+      <rect x="232" y="20" width="440" height="140" rx="10" fill="var(--panel)" stroke="var(--async)" stroke-width="1.5"/>
+      <text x="250" y="46" font-weight="700" font-size="15">Kademlia DHT · stored</text>
+      <g fill="var(--async)" opacity="0.85">
+        <circle cx="268" cy="88" r="9"/><circle cx="296" cy="76" r="9"/><circle cx="296" cy="104" r="9"/><circle cx="324" cy="88" r="9"/>
+      </g>
+      <g font-size="13" class="muted">
+        <text x="350" y="76" class="muted">the nodes closest to hash(topic, author)</text>
+        <text x="350" y="96" class="muted">keep a copy until its TTL runs out</text>
+        <text x="250" y="130" class="muted">late arrivals look it up (cosmos_record_query)</text>
+        <text x="250" y="148" class="muted">the author republishes before the TTL ends</text>
+      </g>
+
+      <!-- gossip lane -->
+      <rect x="232" y="180" width="440" height="220" rx="10" fill="var(--panel)" stroke="var(--accent)" stroke-width="1.5"/>
+      <text x="250" y="206" font-weight="700" font-size="15">Gossip mesh · live</text>
+      <g stroke="var(--accent)" stroke-width="1.5" opacity="0.6">
+        <line x1="280" y1="300" x2="360" y2="262"/><line x1="280" y1="300" x2="360" y2="338"/><line x1="360" y1="262" x2="360" y2="338"/>
+        <line x1="360" y1="262" x2="450" y2="300"/><line x1="360" y1="338" x2="450" y2="300"/><line x1="450" y1="300" x2="540" y2="262"/>
+        <line x1="450" y1="300" x2="540" y2="338"/><line x1="540" y1="262" x2="540" y2="338"/><line x1="540" y1="262" x2="620" y2="300"/><line x1="540" y1="338" x2="620" y2="300"/>
+      </g>
+      <g fill="var(--panel)" stroke="var(--accent)" stroke-width="2">
+        <circle cx="280" cy="300" r="11" fill="var(--accent)"/><circle cx="360" cy="262" r="11"/><circle cx="360" cy="338" r="11"/>
+        <circle cx="450" cy="300" r="11"/><circle cx="540" cy="262" r="11"/><circle cx="540" cy="338" r="11"/><circle cx="620" cy="300" r="11"/>
+      </g>
+      <g font-size="13">
+        <text x="250" y="228" class="muted">only players subscribed to the topic join its mesh</text>
+        <text x="250" y="374" class="muted">each one forwards to a few mesh neighbours,</text>
+        <text x="250" y="392" class="muted">so it reaches everyone in about a second</text>
+      </g>
+
+      <!-- to checks -->
+      <path d="M672 90 H 700" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#ah3)"/>
+      <path d="M672 300 H 700" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#ah3)"/>
+
+      <!-- checks -->
+      <rect x="704" y="20" width="236" height="380" rx="10" fill="var(--panel)" stroke="var(--lock)" stroke-width="1.5"/>
+      <text x="722" y="46" font-weight="700" font-size="15">Every copy is checked</text>
+      <g font-size="13">
+        <text x="722" y="80" font-weight="600">signature</text>
+        <text x="722" y="98" class="muted">signed by its author, gossip too</text>
+        <text x="722" y="132" font-weight="600">topic and namespace</text>
+        <text x="722" y="150" class="muted">no record leaks across games</text>
+        <text x="722" y="184" font-weight="600">newest wins</text>
+        <text x="722" y="202" class="muted">replays and duplicates dropped</text>
+        <text x="722" y="236" font-weight="600">rate limit</text>
+        <text x="722" y="254" class="muted">20 per sender per topic per second</text>
+        <text x="722" y="288" font-weight="600">size and expiry caps</text>
+        <text x="722" y="306" class="muted">TTL clamped, oversize refused</text>
+        <line x1="722" y1="334" x2="922" y2="334" stroke="var(--line)"/>
+        <text x="722" y="362" font-weight="600">→ game gets a record event</text>
+        <text x="722" y="382" class="mono muted" font-size="11">cosmos_poll</text>
+      </g>
+    </svg>
+    </div>
+    <p>Leaving a level drops the subscription, and the player leaves that topic's mesh. Session listings use the same put, but nobody subscribes to their opaque topics, so joiners find them by DHT lookup only.</p>
+    <div class="legend">
+      <span><i style="border-color:var(--async)"></i>stored, looked up later</span>
+      <span><i style="border-color:var(--accent)"></i>pushed live to subscribers</span>
+    </div>
+  </section>
+
+  <section>
+    <h2>Who can see what</h2>
+    <p>"Code holders" are the players you gave the join code to.</p>
+    <div class="scroll">
+    <table>
+      <thead><tr><th>Data</th><th>Lives in</th><th>Readable by</th><th>Protected by</th></tr></thead>
+      <tbody>
+        <tr><td>Join code</td><td class="who">host screen only</td><td><span class="pill code">code holders</span></td><td>never published; 40-bit code from a secret salt</td></tr>
+        <tr><td>Session listing</td><td class="who">DHT + gossip</td><td><span class="pill code">code holders</span></td><td>XChaCha20-Poly1305, key from Argon2id(code, UTC day); host-signed</td></tr>
+        <tr><td>Join secret, session key</td><td class="who">inside the listing</td><td><span class="pill code">code holders</span></td><td>random per session, never derived from the code</td></tr>
+        <tr><td>Host IP addresses</td><td class="who">inside the listing</td><td><span class="pill code">code holders</span></td><td>public addresses only; LAN/VPN only with LAN on</td></tr>
+        <tr><td>SteamID</td><td class="who">DHT record</td><td><span class="pill code">session members</span></td><td>sealed with the session key, opaque topic</td></tr>
+        <tr><td>Cosmos ID over Steam</td><td class="who">Steam handshake</td><td><span class="pill code">session members</span></td><td>HELLO must carry a session-key tag; strangers get silence</td></tr>
+        <tr><td>Game traffic</td><td class="who">direct or Steam relay</td><td><span class="pill code">session members</span></td><td>Noise/TLS end to end, Valve-encrypted on Steam</td></tr>
+        <tr><td>Notes and graves</td><td class="who">DHT + gossip</td><td><span class="pill open">everyone in the game</span></td><td>signed by the author; public on purpose. In Cosmos Depths a note is picked from fixed word lists, so only list numbers travel</td></tr>
+        <tr><td>Ghosts</td><td class="who">gossip (15 s TTL)</td><td><span class="pill open">players on that depth</span></td><td>only room + spot + a random tag; your own party never sees you as a ghost</td></tr>
+        <tr><td>Public lobby listing</td><td class="who">DHT + gossip</td><td><span class="pill open">everyone in the game</span></td><td>opt-in (host a public run): the join code is public, so anyone can join</td></tr>
+      </tbody>
+    </table>
+    </div>
+  </section>
+</main>
+
+</body></html>

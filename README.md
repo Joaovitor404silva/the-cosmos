@@ -22,6 +22,18 @@ the demo game built on the SDK.
 Lag on the async plane (records) never touches the session. Rule of thumb: if
 the game can live with it arriving late, make it a record.
 
+## How it works
+
+The full diagram page is [docs/architecture.html](docs/architecture.html); open it in a browser for light and dark themes.
+
+![The stack](docs/img/arch-stack.png)
+
+![Joining with a code](docs/img/arch-join.png)
+
+![The DHT and the gossip mesh](docs/img/arch-gossip.png)
+
+![Who can see what](docs/img/arch-privacy.png)
+
 ## Layout
 
 | Path | |
