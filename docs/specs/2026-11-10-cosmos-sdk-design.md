@@ -23,7 +23,7 @@ Per peer pair, tried in parallel, best path wins:
 
 1. LAN / IPv6 / UPnP direct.
 2. Hole punch (dcutr + port guessing, from bb-p2p `mesh`).
-3. **Steam relay (SDR)** — for **any** game, Steam version or not; the only need is the Steam client running and logged in on the player's PC (as online-fix and Bloodborne Seamless Coop do). Used like Seamless Coop: Steam carries signaling and traffic **until** a direct path is up, then the session migrates to direct and drops Steam. If direct can't hold, it stays on (or falls back to) Steam.
+3. **Steam relay (SDR)** — for **any** game, Steam version or not; the only need is the Steam client running and logged in on the player's PC. Steam carries signaling and traffic **until** a direct path is up, then the session migrates to direct and drops Steam. If direct can't hold, it stays on (or falls back to) Steam.
 No Cosmos-hosted relay. Only if the Steam client isn't running if direct and punch both fail, the peers can't connect and the SDK reports it (`COSMOS_ERR_NO_PATH`). Hole punch signaling without a relay goes through the DHT: each peer publishes its signed observed addresses, then both dial at the same time.
 
 While on the Steam relay, the SDK keeps retrying direct in the background and migrates without dropping the session (path migration under the channel layer; sequence numbers make the switch invisible to the game).
@@ -48,7 +48,7 @@ While on the Steam relay, the SDK keeps retrying direct in the background and mi
 | `cosmos-node` | optional daemon process hosting facades for unchanged games | from bb-p2p `node` |
 | `facades/*` | fake an existing backend (first: shadNet; later Steam P2P/EOS shims) | bb-p2p `facade` (generic parts only) |
 
-`cosmos-node` and `facades/*` come after the demo. Game-specific logic (e.g. Bloodborne world/chalice) never enters the SDK; other games are separate consumers, done later.
+`cosmos-node` and `facades/*` come after the demo. Game-specific logic never enters the SDK; other games are separate consumers, done later.
 
 ### C API shape (sketch)
 ```c
