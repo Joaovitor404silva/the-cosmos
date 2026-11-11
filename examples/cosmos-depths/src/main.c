@@ -15,6 +15,20 @@
 #include <string.h>
 #include "raylib.h"
 #include "depths.h"
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+/* Browser: give the page one frame (rAF, or 100 ms when the tab is hidden)
+ * so it can draw, run network callbacks and calls from worker threads. */
+EM_ASYNC_JS(void, web_frame, (void), {
+    await new Promise((done) => {
+        const t = setTimeout(done, 100);
+        requestAnimationFrame(() => { clearTimeout(t); done(); });
+    });
+});
+#define QUIT_LINE 0
+#else
+#define QUIT_LINE 1
+#endif
 
 #define CW 16
 #define CH 20
@@ -276,8 +290,13 @@ int main(int argc, char **argv) {
     InitWindow(WIN_W, WIN_H, "Cosmos Depths");
     if (wx >= 0) SetWindowPosition(wx, wy);
     SetExitKey(0);
-    SetTargetFPS(60);
-    font = plat_file_exists("C:\\Windows\\Fonts\\consola.ttf") ? LoadFontEx("C:\\Windows\\Fonts\\consola.ttf", 40, NULL, 0) : GetFontDefault();
+#ifndef __EMSCRIPTEN__
+    SetTargetFPS(60); /* the browser paces frames itself (web_frame) */
+#endif
+    plat_exe_dir(path, sizeof path); /* else font.ttf next to the exe (the web build embeds one) */
+    strncat(path, "font.ttf", sizeof path - strlen(path) - 1);
+    if (plat_file_exists("C:\\Windows\\Fonts\\consola.ttf")) font = LoadFontEx("C:\\Windows\\Fonts\\consola.ttf", 40, NULL, 0);
+    else font = plat_file_exists(path) ? LoadFontEx(path, 40, NULL, 0) : GetFontDefault();
     SetTextureFilter(font.texture, TEXTURE_FILTER_BILINEAR);
 
     if (host_now || code[0] || join_file[0] || browse_now) {
@@ -295,7 +314,7 @@ int main(int argc, char **argv) {
         double t = GetTime();
 
         if (screen == SCR_MENU) {
-            if (IsKeyPressed(KEY_ESCAPE)) break;
+            if (QUIT_LINE && IsKeyPressed(KEY_ESCAPE)) break;
             if (IsKeyPressed(KEY_H) || IsKeyPressed(KEY_P) || IsKeyPressed(KEY_J) || IsKeyPressed(KEY_L)) {
                 int host = IsKeyPressed(KEY_H) || IsKeyPressed(KEY_P), pub = IsKeyPressed(KEY_P), list = IsKeyPressed(KEY_L);
                 while (GetCharPressed()) {} /* drop the keystroke */
@@ -375,7 +394,7 @@ int main(int argc, char **argv) {
                 text("[P]  host a public run (listed: anyone can join)", 60, 295, 30, TEXT);
                 text("[L]  lobby list", 60, 340, 30, TEXT);
                 text("[J]  join with a code", 60, 385, 30, TEXT);
-                text("[Esc] quit", 60, 430, 30, DIM);
+                if (QUIT_LINE) text("[Esc] quit", 60, 430, 30, DIM);
             } else if (screen == SCR_LOBBY) {
                 text("public runs: press the number to join, Esc back", 60, 250, 22, DIM);
                 if (g && g->n_lobbies == 0) text(TextFormat("looking%.*s", (int)(t * 2) % 4, "..."), 60, 300, 28, TEXT);
@@ -397,6 +416,9 @@ int main(int argc, char **argv) {
         }
         EndDrawing();
 
+#ifdef __EMSCRIPTEN__
+        web_frame();
+#endif
         if (quit_at > 0 && t >= quit_at) break;
         if (shot[0] && played >= shot_after && quit_at == 0) {
             /* Without the high-DPI flag the frame is the render size, but

@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cosmos Depths</title>
+<meta name="description" content="Cosmos Depths: a free co-op ASCII dungeon descent for 1-4 players in the browser. Serverless multiplayer over public Nostr relays and WebRTC.">
+<script src="coi-serviceworker.js"></script>
+<style>
+  :root { --bg: #0a0a10; --panel: #12121c; --text: #d6dae6; --dim: #6e748c; --amber: #ffce5c; --line: #24243a; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 ui-monospace, Consolas, "Cascadia Mono", Menlo, monospace; }
+  main { max-width: 1120px; margin: 0 auto; padding: 16px; }
+  h1 { margin: 4px 0 2px; font-size: 22px; color: var(--amber); letter-spacing: .08em; }
+  .sub { color: var(--dim); margin: 0 0 12px; }
+  .frame { position: relative; background: #000; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+  canvas { display: block; width: 100%; height: auto; outline: none; image-rendering: auto; }
+  #status { position: absolute; inset: 0; display: grid; place-items: center; color: var(--dim); background: var(--bg); }
+  #status.hidden { display: none; }
+  .keys { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 8px 24px; margin: 14px 0; color: var(--dim); }
+  .keys b { color: var(--text); font-weight: 600; }
+  footer { color: var(--dim); border-top: 1px solid var(--line); margin-top: 14px; padding-top: 10px; font-size: 13px; }
+  a { color: var(--amber); }
+  @media (max-width: 700px) { body { font-size: 13px; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>COSMOS DEPTHS</h1>
+  <p class="sub">A co-op descent for 1-4 players. Host a run and share the code, or open the lobby list. Notes and graves outlive the run.</p>
+  <div class="frame">
+    <canvas id="canvas" tabindex="0" oncontextmenu="event.preventDefault()"></canvas>
+    <div id="status">loading...</div>
+  </div>
+  <div class="keys">
+    <div><b>H</b> host &nbsp; <b>P</b> public host &nbsp; <b>L</b> lobby &nbsp; <b>J</b> join</div>
+    <div><b>arrows / WASD</b> move and attack &nbsp; <b>Q E Z C</b> diagonals</div>
+    <div><b>Space</b> descend on &gt; &nbsp; <b>N</b> write a note &nbsp; <b>Esc</b> leave</div>
+  </div>
+  <footer>
+    No game server: players meet through public <a href="https://nostr.com" rel="noopener">Nostr</a> relays and play over direct WebRTC
+    connections. On very strict networks (some mobile or office NATs) two players may not reach each other.
+    Needs a keyboard. Built with <a href="https://www.raylib.com" rel="noopener">raylib</a> (zlib licence).
+  </footer>
+</main>
+<script src="cosmos-web.js"></script>
+<script>
+  const status = document.getElementById('status');
+  const canvas = document.getElementById('canvas');
+  const q = new URLSearchParams(location.search);
+  const args = [];
+  for (const f of ['host', 'public', 'browse', 'bot']) if (q.has(f)) args.push('--' + f);
+  if (q.get('join')) args.push('--join', q.get('join'));
+  canvas.addEventListener('click', () => canvas.focus());
+  var Module = {
+    canvas,
+    arguments: args,
+    print: (t) => console.log(t),
+    printErr: (t) => console.warn(t),
+    setStatus: (t) => { status.textContent = t || ''; status.classList.toggle('hidden', !t); },
+    onRuntimeInitialized: () => { status.classList.add('hidden'); canvas.focus(); },
+  };
+  if (window.crossOriginIsolated) {
+    const s = document.createElement('script');
+    s.src = 'cosmos-depths.js';
+    document.body.appendChild(s);
+  } else {
+    // coi-serviceworker reloads the page once with COOP/COEP set
+    Module.setStatus('enabling threads (one reload)...');
+    setTimeout(() => Module.setStatus('this browser cannot enable threads here (needs SharedArrayBuffer)'), 6000);
+  }
+</script>
+</body>
+</html>

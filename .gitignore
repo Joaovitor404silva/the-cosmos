@@ -5,3 +5,4 @@
 # Cosmos Depths: downloaded raylib (fetch-raylib.ps1) and build output.
 /examples/cosmos-depths/vendor/
 /dist/
+/.tools/

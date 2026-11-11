@@ -1,0 +1,19 @@
+{
+  "name": "cosmos-depths-web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "bundle": "esbuild src/entry.js --bundle --format=iife --global-name=CosmosWeb --minify --outfile=build/cosmos-web.js",
+    "test": "esbuild test/scenario.js --bundle --format=iife --outfile=build/scenario.js && node test/run.mjs"
+  },
+  "dependencies": {
+    "@noble/curves": "1.9.7",
+    "@noble/hashes": "1.8.0",
+    "hash-wasm": "4.12.0"
+  },
+  "devDependencies": {
+    "coi-serviceworker": "0.1.7",
+    "esbuild": "0.25.10",
+    "puppeteer-core": "24.22.0"
+  }
+}
