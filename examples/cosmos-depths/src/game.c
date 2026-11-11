@@ -17,6 +17,10 @@
  * Async plane (records under key "d<depth>", so any run reaches them):
  *   "note"  [room, dx, dy, text]   a player's note on a floor tile
  *   "grave" [room, dx, dy, cause]  where and how a player died
+ *   "ghost" [room, dx, dy, tag]    where a living player is now; put every
+ *                                  few seconds, short TTL. Other runs on
+ *                                  the same depth draw it as a faint @; a
+ *                                  tag of my own party is skipped.
  * Room index + offset inside the room places a mark on any map of that
  * depth. One record per player and kind per depth; a new one replaces it.
  *
@@ -36,6 +40,7 @@ enum { MSG_HELLO = 'H', MSG_LEVEL = 'L', MSG_INTENT = 'I', MSG_SNAP = 'S', MSG_E
 enum { EVT_KILL = 1, EVT_DEATH, EVT_PICKUP };
 
 #define RECORD_TTL 1800u /* the SDK's cap: 30 minutes */
+#define GHOST_TTL 10u
 #define VIEW 9           /* monsters notice players this close */
 #define POTION_HP 8
 #define CAUSE_MAX 40
@@ -123,7 +128,7 @@ static int job_main(void *arg) {
     } else if (j->what == JOB_JOIN) {
         r = cosmos_join(c, j->code);
     } else {
-        r = cosmos_record_put(c, j->kind, j->key, j->data, j->len, RECORD_TTL);
+        r = cosmos_record_put(c, j->kind, j->key, j->data, j->len, j->ttl);
     }
     j->result = r;
     if (r != COSMOS_OK) snprintf(j->err, sizeof j->err, "%s: %s", cosmos_error_name(r), cosmos_last_error());
@@ -231,13 +236,49 @@ static void send_hello(Game *g, uint32_t to) {
 
 /* ---- async plane: notes and graves ---- */
 
-static void place_mark(const Game *g, Mark *m) {
+/* Room index + offset -> a tile on this map, or -1 if not this depth. */
+static void place_spot(const Game *g, int depth, int room, int dx, int dy, int *x, int *y) {
     const Room *r;
-    m->x = m->y = -1;
-    if (!g->have_level || g->lv.depth != m->depth || g->lv.n_rooms == 0) return;
-    r = &g->lv.rooms[m->room % g->lv.n_rooms];
-    m->x = r->x + (m->dx < r->w ? m->dx : r->w - 1);
-    m->y = r->y + (m->dy < r->h ? m->dy : r->h - 1);
+    *x = *y = -1;
+    if (!g->have_level || g->lv.depth != depth || g->lv.n_rooms == 0) return;
+    r = &g->lv.rooms[room % g->lv.n_rooms];
+    *x = r->x + (dx < r->w ? dx : r->w - 1);
+    *y = r->y + (dy < r->h ? dy : r->h - 1);
+}
+
+static void place_mark(const Game *g, Mark *m) { place_spot(g, m->depth, m->room, m->dx, m->dy, &m->x, &m->y); }
+
+/* A tile as [room, dx, dy] for a record. */
+static void spot_bytes(const Game *g, int x, int y, uint8_t out[3]) {
+    int room = level_room_at(&g->lv, x, y), dx = x - g->lv.rooms[room].x, dy = y - g->lv.rooms[room].y;
+    out[0] = (uint8_t)room;
+    out[1] = (uint8_t)(dx < 0 ? 0 : dx);
+    out[2] = (uint8_t)(dy < 0 ? 0 : dy);
+}
+
+static void on_ghost(Game *g, const cosmos_event_t *ev) {
+    Ghost *gh = NULL;
+    uint32_t tag;
+    if (ev->len != 7) return;
+    tag = get_u32(ev->data + 3);
+    if ((ev->publisher_len == g->my_id_len && !memcmp(ev->publisher, g->my_id, g->my_id_len)) || game_slot_of(g, tag) >= 0)
+        return; /* me, or someone in my own run: they are real, not ghosts */
+    for (int i = 0; i < g->n_ghosts && !gh; i++)
+        if (g->ghosts[i].pub_len == ev->publisher_len && !memcmp(g->ghosts[i].pub, ev->publisher, ev->publisher_len)) gh = &g->ghosts[i];
+    if (!gh && g->n_ghosts < MAX_GHOSTS) gh = &g->ghosts[g->n_ghosts++];
+    if (!gh) { /* full: replace the stalest */
+        gh = &g->ghosts[0];
+        for (int i = 1; i < MAX_GHOSTS; i++) if (g->ghosts[i].seen < gh->seen) gh = &g->ghosts[i];
+    }
+    memcpy(gh->pub, ev->publisher, ev->publisher_len);
+    gh->pub_len = ev->publisher_len;
+    gh->tag = tag;
+    gh->depth = g->marks_depth;
+    gh->room = ev->data[0];
+    gh->dx = ev->data[1];
+    gh->dy = ev->data[2];
+    gh->seen = g->now;
+    place_spot(g, gh->depth, gh->room, gh->dx, gh->dy, &gh->x, &gh->y);
 }
 
 static void depth_key(char *out, size_t cap, int depth) { snprintf(out, cap, "d%d", depth); }
@@ -257,6 +298,10 @@ static void on_record(Game *g, const cosmos_event_t *ev) {
         return;
     depth_key(key, sizeof key, g->marks_depth);
     if (strcmp(ev->record_key, key)) return; /* an older depth's answer */
+    if (!strcmp(ev->record_kind, "ghost")) {
+        on_ghost(g, ev);
+        return;
+    }
     if (!strcmp(ev->record_kind, "note")) grave = 0;
     else if (!strcmp(ev->record_kind, "grave")) grave = 1;
     else return;
@@ -279,10 +324,13 @@ void game_watch_depth(Game *g, int depth) {
     if (depth != g->marks_depth) {
         if (g->sub_note > 0) cosmos_record_unsubscribe(g->c, g->sub_note);
         if (g->sub_grave > 0) cosmos_record_unsubscribe(g->c, g->sub_grave);
+        if (g->sub_ghost > 0) cosmos_record_unsubscribe(g->c, g->sub_ghost);
         g->n_marks = 0;
+        g->n_ghosts = 0;
         g->marks_depth = depth;
         g->sub_note = cosmos_record_subscribe(g->c, "note", key);
         g->sub_grave = cosmos_record_subscribe(g->c, "grave", key);
+        g->sub_ghost = cosmos_record_subscribe(g->c, "ghost", key); /* live only: no query */
     }
     g->req += 2;
     cosmos_record_query(g->c, "note", key, g->req);
@@ -299,19 +347,16 @@ static int start_put(Game *g, const char *kind, int x, int y, int depth, const c
     memset(m, 0, sizeof *m);
     m->grave = !strcmp(kind, "grave");
     m->depth = depth;
-    m->room = level_room_at(&g->lv, x, y);
-    m->dx = x - g->lv.rooms[m->room].x;
-    m->dy = y - g->lv.rooms[m->room].y;
-    if (m->dx < 0) m->dx = 0;
-    if (m->dy < 0) m->dy = 0;
+    spot_bytes(g, x, y, j->data);
+    m->room = j->data[0];
+    m->dx = j->data[1];
+    m->dy = j->data[2];
     memcpy(m->text, text, n);
     memcpy(m->pub, g->my_id, g->my_id_len);
     m->pub_len = g->my_id_len;
-    j->data[0] = (uint8_t)m->room;
-    j->data[1] = (uint8_t)m->dx;
-    j->data[2] = (uint8_t)m->dy;
     memcpy(j->data + 3, text, n);
     j->len = 3 + n;
+    j->ttl = RECORD_TTL;
     copy_str(j->kind, sizeof j->kind, kind);
     depth_key(j->key, sizeof j->key, depth);
     return job_start(g, j, JOB_PUT);
@@ -334,6 +379,10 @@ static void apply_level(Game *g, uint32_t seed, int depth) {
     memset(g->seen, 0, sizeof g->seen);
     for (int i = 0; i < g->n_marks; i++) place_mark(g, &g->marks[i]);
     game_watch_depth(g, depth);
+    for (int i = 0; i < g->n_ghosts; i++) {
+        Ghost *gh = &g->ghosts[i];
+        place_spot(g, gh->depth, gh->room, gh->dx, gh->dy, &gh->x, &gh->y);
+    }
     log_add(g, depth == 1 ? "A new descent begins. Depth 1." : "Down the stairs: depth %d.", depth);
 }
 
@@ -724,12 +773,14 @@ void game_free(Game *g) {
     if (!g) return;
     g->quitting = 1;
     until = plat_now() + 1.5;
-    while ((g->net.thread && !plat_thread_done(g->net.thread)) || (g->put.thread && !plat_thread_done(g->put.thread))) {
+    while ((g->net.thread && !plat_thread_done(g->net.thread)) || (g->put.thread && !plat_thread_done(g->put.thread)) ||
+           (g->ghost_put.thread && !plat_thread_done(g->ghost_put.thread))) {
         if (plat_now() > until) return;
         plat_sleep(20);
     }
     plat_thread_join(g->net.thread);
     plat_thread_join(g->put.thread);
+    plat_thread_join(g->ghost_put.thread);
     cosmos_shutdown(g->c);
     free(g);
 }
@@ -861,9 +912,29 @@ static void collect_jobs(Game *g) {
     }
 }
 
+/* While alive, tell other runs on this depth where I am. A failed put
+ * (rate limit, no peers yet) just waits for the next one. */
+static void ghost_tick(Game *g) {
+    Player *me = game_me(g);
+    Job *j = &g->ghost_put;
+    job_finished(j);
+    if (g->state != ST_PLAYING || !g->have_level || !me || me->hp <= 0 || g->now < g->next_ghost || j->thread) return;
+    g->next_ghost = g->now + GHOST_EVERY;
+    spot_bytes(g, g->me_x, g->me_y, j->data);
+    put_u32(j->data + 3, g->my_tag);
+    j->len = 7;
+    j->ttl = GHOST_TTL;
+    copy_str(j->kind, sizeof j->kind, "ghost");
+    depth_key(j->key, sizeof j->key, g->lv.depth);
+    job_start(g, j, JOB_PUT);
+}
+
 void game_update(Game *g, double now) {
+    g->now = now;
     collect_jobs(g);
     poll_events(g);
+    ghost_tick(g);
+
     if (!g->is_host || g->state != ST_PLAYING) return;
     if (now >= g->next_tick) {
         g->next_tick = now - g->next_tick > 0.5 ? now + 1.0 / TICK_HZ : g->next_tick + 1.0 / TICK_HZ;

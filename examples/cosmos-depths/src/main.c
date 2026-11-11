@@ -34,6 +34,7 @@ static const Color DIM = {110, 116, 140, 255};
 static const Color AMBER = {255, 206, 92, 255};
 static const Color NOTE_C = {120, 230, 120, 255};
 static const Color GRAVE_C = {170, 180, 210, 255};
+static const Color GHOST_C = {150, 200, 255, 255};
 static const Color MON_C[3] = {{230, 120, 220, 255}, {255, 140, 60, 255}, {255, 70, 70, 255}};
 
 static Font font;
@@ -98,7 +99,14 @@ static void draw_map(Game *g, double t) {
         if (m->grave) glyph(m->x, m->y, '+', Fade(GRAVE_C, 0.45f + 0.15f * sinf((float)t * 2)));
         else glyph(m->x, m->y, '?', NOTE_C);
     }
+    for (int i = 0; i < g->n_ghosts; i++) { /* players of other runs, here and now */
+        const Ghost *gh = &g->ghosts[i];
+        float age = (float)(g->now - gh->seen);
+        if (gh->x < 0 || !vis[gh->y][gh->x] || age >= GHOST_FADE) continue;
+        glyph(gh->x, gh->y, '@', Fade(GHOST_C, 0.4f * (1.0f - age / (float)GHOST_FADE) + 0.05f * sinf((float)t * 3)));
+    }
     for (int i = 0; i < lv->n_items; i++)
+
         if (!lv->items[i].taken && vis[lv->items[i].y][lv->items[i].x]) glyph(lv->items[i].x, lv->items[i].y, '!', SKYBLUE);
     for (int i = 0; i < lv->n_mon; i++) {
         const Monster *m = &lv->mon[i];

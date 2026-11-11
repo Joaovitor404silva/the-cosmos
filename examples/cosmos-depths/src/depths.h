@@ -18,6 +18,9 @@
 #define MAX_PENDING 8
 #define NOTE_MAX 48
 #define MAX_MARKS 32
+#define MAX_GHOSTS 16
+#define GHOST_EVERY 3.0 /* s between ghost puts */
+#define GHOST_FADE 8.0  /* s a ghost stays visible without news */
 #define LOG_LINES 6
 #define TICK_HZ 6
 #define PLAYER_HP 20
@@ -103,6 +106,15 @@ typedef struct {
     int is_host;
 } Peer;
 
+/* Another run's player on this depth, seen through its ghost records. */
+typedef struct {
+    uint8_t pub[COSMOS_PEER_ID_MAX];
+    size_t pub_len;
+    uint32_t tag;
+    int depth, room, dx, dy, x, y;
+    double seen; /* game time of the last record */
+} Ghost;
+
 /* One blocking cosmos call on a worker thread. */
 typedef struct {
     void *thread;
@@ -112,6 +124,7 @@ typedef struct {
     char kind[16], key[16];
     uint8_t data[128];
     size_t len;
+    uint32_t ttl;
     int result;
     char err[160];
 } Job;
@@ -156,9 +169,12 @@ typedef struct Game {
     /* async plane */
     Mark marks[MAX_MARKS];
     int n_marks, marks_depth;
-    int sub_note, sub_grave;
+    int sub_note, sub_grave, sub_ghost;
     uint32_t req;
-    Job net, put;
+    Job net, put, ghost_put;
+    Ghost ghosts[MAX_GHOSTS];
+    int n_ghosts;
+    double now, next_ghost;
     Mark put_mark; /* what the put worker is writing */
     int puts_done;
     char grave_queue[NOTE_MAX + 1]; /* death mark waiting for the put worker */
@@ -173,7 +189,8 @@ void game_join(Game *g, const char *code);
 void game_update(Game *g, double now);
 int game_input(Game *g, int act);           /* queue an intent; 0 if full or dead */
 int game_put_note(Game *g, const char *text); /* at my spot; 0 if busy */
-void game_watch_depth(Game *g, int depth);  /* query + subscribe notes and graves */
+void game_watch_depth(Game *g, int depth);  /* query notes and graves, subscribe to them and ghosts */
+
 void game_hurt(Game *g, int slot, int dmg, const char *cause); /* host only */
 Player *game_me(Game *g);                   /* NULL until the host lists me */
 int game_slot_of(const Game *g, uint32_t tag);

@@ -99,6 +99,14 @@ static int has_mark(Game *x, int grave, const Game *by, const char *text) {
     return 0;
 }
 
+static int has_ghost(const Game *x, const Game *of) {
+    for (int k = 0; k < x->n_ghosts; k++)
+        if (x->ghosts[k].tag == of->my_tag && x->ghosts[k].pub_len == of->my_id_len && !memcmp(x->ghosts[k].pub, of->my_id, of->my_id_len))
+            return 1;
+    return 0;
+}
+
+static int ghost_fresh(void) { return has_ghost(fresh, g[1]); }
 static int put1_done(void) { return g[1]->puts_done > 0; }
 static int put3_done(void) { return g[3]->puts_done > 0; }
 static int note_live(void) { return has_mark(g[2], 0, g[1], NOTE_TEXT); }
@@ -205,7 +213,15 @@ int selftest(void) {
     if (!wait_for(put3_done, 40) || g[3]->put.result != COSMOS_OK) { fail("grave put"); goto out; }
     if (!fresh_finds(grave_fresh)) { fail("grave query"); goto out; }
     printf("ok: death mark of player 3 queried back by a fresh instance\n");
+
+    game_watch_depth(fresh, g[0]->lv.depth);
+    if (!wait_for(ghost_fresh, 20)) { fail("ghost"); goto out; }
+    for (int i = 0; i < N; i++)
+        for (int j = 0; j < N; j++)
+            if (has_ghost(g[i], g[j])) { fail("a player saw a ghost of its own party"); goto out; }
+    printf("ok: player 1's ghost seen live from another run, never by its own party\n");
     r = 0;
+
 
 out:
     game_free(fresh);
