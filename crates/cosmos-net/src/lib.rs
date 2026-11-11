@@ -701,6 +701,12 @@ fn advertised_from<'a>(
     out
 }
 
+/// Private-scope peers are fair game with LAN discovery on, or when the
+/// game listens on an explicit private IP (it chose a LAN).
+fn private_ok(cfg: &Config) -> bool {
+    cfg.mdns || cfg.listen.iter().any(|l| addr_scope(l) == Scope::Private && !is_unspecified(l))
+}
+
 fn hint_allowed(addr: &Multiaddr, local_only: bool, lan: bool) -> bool {
     if is_dns(addr) {
         return false;
@@ -1870,7 +1876,7 @@ impl EventLoop {
             }
             Command::Connect { peer, reply } => self.connect_peer(peer, Some(reply)),
             Command::DialHint { addr, reply } => {
-                if hint_allowed(&addr, self.local_only(), self.cfg.mdns) {
+                if hint_allowed(&addr, self.local_only(), private_ok(&self.cfg)) {
                     self.on_command(Command::Dial { addr, reply });
                 } else {
                     let _ = reply.send(Err(anyhow!("address scope not allowed: {addr}")));
@@ -3997,6 +4003,12 @@ mod tests {
         assert!(hint_allowed(&lan, false, true));
         assert!(hint_allowed(&lo, true, false));
         assert!(!hint_allowed(&ma("/dns4/example.com/tcp/80"), false, true));
+        // Review finding 6: an explicit private listen IP means same-LAN play.
+        let cfg = |l: &str, mdns| Config { listen: vec![ma(l)], mdns, ..Config::default() };
+        assert!(private_ok(&cfg("/ip4/192.168.1.2/udp/0/quic-v1", false)));
+        assert!(!private_ok(&cfg("/ip4/0.0.0.0/udp/0/quic-v1", false)));
+        assert!(!private_ok(&cfg("/ip4/8.8.8.8/udp/0/quic-v1", false)));
+        assert!(private_ok(&cfg("/ip4/0.0.0.0/udp/0/quic-v1", true)));
     }
 
     /// Audit finding 4: LAN/VPN/CGNAT interface addresses and non-global

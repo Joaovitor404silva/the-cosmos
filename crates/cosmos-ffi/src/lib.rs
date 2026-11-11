@@ -114,7 +114,9 @@ pub struct CosmosConfig {
     pub bootstrap: *const c_char,
     /// Directory for the record cache. NULL: memory only.
     pub cache_dir: *const c_char,
-    /// Nonzero: LAN discovery (mDNS) and UPnP port mapping.
+    /// Nonzero: LAN discovery (mDNS) and UPnP port mapping. Same-LAN play
+    /// needs this or an explicit private `listen` IP; otherwise private
+    /// addresses are neither advertised nor dialled.
     pub lan: i32,
     /// Nonzero: add the Steam relay path when Steam is running. When it is
     /// not, the path stays off without an error.
@@ -122,8 +124,9 @@ pub struct CosmosConfig {
     /// Absolute path of steam_api64.dll. NULL: the one next to the exe.
     pub steam_dll: *const c_char,
     /// AppID for our own Steam init (ignored when the game already runs
-    /// Steam). Required in release builds when `steam` is on (init fails
-    /// with E_INVALID on 0); debug builds fall back to 480 (Spacewar).
+    /// Steam). Release builds with 0 never init Steam themselves: the path
+    /// stays off unless the game runs Steam. Debug builds fall back to 480
+    /// (Spacewar).
     pub steam_app_id: u32,
     /// Events kept before the oldest are dropped. 0: 1024.
     pub event_queue: u32,
@@ -540,6 +543,8 @@ struct State {
     tasks: Mutex<Vec<JoinHandle<()>>>,
     steam: Option<Arc<SteamApi>>,
     steam_link: Option<SteamLink>,
+    /// The SteamID republish loop; stopped when the session ends.
+    steam_pub: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
 }
 
 /// The Steam path's pieces that need the join code's session key.
@@ -560,6 +565,7 @@ fn load_key(path: Option<String>) -> Result<Keypair, Fail> {
     match std::fs::read(&path) {
         Ok(b) => Keypair::from_protobuf_encoding(&b).map_err(|e| fail(COSMOS_E_INVALID, format!("key file: {e}"))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            clean_stale_temps(&path);
             let k = Keypair::generate_ed25519();
             let b = k.to_protobuf_encoding().map_err(|e| fail(COSMOS_E_IO, e))?;
             if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
@@ -579,6 +585,8 @@ fn load_key(path: Option<String>) -> Result<Keypair, Fail> {
 /// Create `path` holding `bytes`, all or nothing: written and synced to an
 /// owner-only temp file, then hard-linked into place (fails with
 /// `AlreadyExists` instead of replacing a key another instance just made).
+/// File systems without hard links (FAT, some network shares) get a direct
+/// `create_new` write instead. On Windows the file inherits the folder's ACL.
 fn write_new_key(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let mut rnd = [0u8; 8];
@@ -596,7 +604,32 @@ fn write_new_key(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
         std::fs::hard_link(&tmp, path)
     })();
     let _ = std::fs::remove_file(&tmp);
-    r
+    match r {
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists && !path.exists() => {
+            tracing::debug!("key file hard link: {e}; writing in place");
+            let mut f = opts.open(path)?;
+            f.write_all(bytes).and_then(|()| f.sync_all()).inspect_err(|_| {
+                drop(f);
+                let _ = std::fs::remove_file(path);
+            })
+        }
+        r => r,
+    }
+}
+
+/// Remove temp files a crashed `write_new_key` left next to `path` (older
+/// than a minute, so another instance's write in flight is spared).
+fn clean_stale_temps(path: &std::path::Path) {
+    let (Some(dir), Some(stem)) = (path.parent(), path.file_stem()) else { return };
+    let dir = if dir.as_os_str().is_empty() { std::path::Path::new(".") } else { dir };
+    let prefix = format!("{}.tmp", stem.to_string_lossy());
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let old = e.metadata().ok().and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok());
+        if e.file_name().to_string_lossy().starts_with(&prefix) && old.is_some_and(|d| d > Duration::from_secs(60)) {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
 }
 
 fn listen_addrs(ip: &str) -> Result<Vec<Multiaddr>, Fail> {
@@ -644,8 +677,9 @@ unsafe fn init(cfg: *const CosmosConfig) -> Result<Box<Cosmos>, Fail> {
         ..Config::default()
     };
     let node = rt.block_on(Node::start(net)).map_err(|e| fail(COSMOS_E_NET, format!("node: {e:#}")))?;
-    if listen.is_some() {
-        // An explicit IP is reachable as is (LAN, loopback tests).
+    // An explicit IP is reachable as is (LAN, loopback tests); 0.0.0.0 / ::
+    // only means "all interfaces" and must not advertise every one of them.
+    if listen.as_deref().is_some_and(|ip| !ip.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_unspecified())) {
         for a in rt.block_on(node.listen_addrs()) {
             node.add_external_addr(a);
         }
@@ -659,10 +693,10 @@ unsafe fn init(cfg: *const CosmosConfig) -> Result<Box<Cosmos>, Fail> {
     let mut steam_link = None;
     if cfg.steam != 0 {
         let dll = steam_dll.or_else(|| Some(std::env::current_exe().ok()?.parent()?.join(cosmos_steam::DLL_NAME)));
-        // Release builds must name their own AppID (480 is Valve's test app).
+        // Release builds must name their own AppID (480 is Valve's test app):
+        // 0 keeps the path off unless the game already runs Steam.
         let app_id = match cfg.steam_app_id {
             0 if cfg!(debug_assertions) => 480,
-            0 => return Err(fail(COSMOS_E_INVALID, "steam_app_id is required when steam is on")),
             id => id,
         };
         let scfg = SteamConfig { app_id, dll };
@@ -705,6 +739,7 @@ unsafe fn init(cfg: *const CosmosConfig) -> Result<Box<Cosmos>, Fail> {
         tasks: Mutex::new(tasks),
         steam,
         steam_link,
+        steam_pub: Arc::default(),
     };
     drop(_g);
     Ok(Box::new(Cosmos { st, rt }))
@@ -730,8 +765,15 @@ impl Cosmos {
         let s = Arc::new(s);
         *lock(&self.st.session) = Some(s.clone());
         let shared = self.st.shared.clone();
+        let steam_pub = self.st.steam_pub.clone();
         let pump = self.rt.spawn(async move {
             while let Some(e) = rx.recv().await {
+                if matches!(e, SessionEvent::Ended) {
+                    // Members stop announcing a session that is over.
+                    if let Some(t) = lock(&steam_pub).take() {
+                        t.abort();
+                    }
+                }
                 let joined = match &e {
                     SessionEvent::Joined(p) => Some(*p),
                     _ => None,
@@ -768,6 +810,9 @@ impl Cosmos {
                 tokio::time::sleep(wait).await;
             }
         });
+        if let Some(old) = lock(&self.st.steam_pub).replace(task.abort_handle()) {
+            old.abort();
+        }
         lock(&self.st.tasks).push(task);
     }
 
@@ -820,11 +865,7 @@ impl Cosmos {
     fn join_inner(&self, code: String) -> Result<(), Fail> {
         let st = &self.st;
         let start = Instant::now();
-        let (ns, c) = (st.ns.clone(), code.clone());
-        let keys = self
-            .rt
-            .block_on(async { tokio::task::spawn_blocking(move || code::keys(&ns, &c)).await })
-            .map_err(|e| fail(COSMOS_E_PANIC, e))?;
+        let keys = self.rt.block_on(code::keys_today(&st.ns, &code)).map_err(|e| fail(COSMOS_E_INVALID, e))?;
         let advert = self.rt.block_on(async {
             loop {
                 match code::resolve_with(&st.node, &st.ns, &code, &keys).await {
@@ -841,9 +882,9 @@ impl Cosmos {
                 }
             }
         })?;
-        self.session_key(keys.session);
+        self.session_key(advert.session);
         let t = self.take_transport()?;
-        let cfg = SessionConfig { join_secret: Some(keys.secret), join_timeout: JOIN_TIMEOUT, ..SessionConfig::default() };
+        let cfg = SessionConfig { join_secret: Some(advert.secret), join_timeout: JOIN_TIMEOUT, ..SessionConfig::default() };
         let s = self.rt.block_on(Session::join(t, cfg, advert.host, advert.addrs)).map_err(join_err)?;
         self.start_session(s);
         Ok(())

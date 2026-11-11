@@ -404,3 +404,25 @@ async fn strangers_get_no_proof() {
     x.send(SA, &bind::hello_tagged(bind::HELLO, &n, Some(&SESSION), SX, SA), true).unwrap();
     assert_eq!(replies(&n).await, vec![a.id()]);
 }
+
+/// Review finding 3: data from a SteamID we never knew gets no reply, so
+/// strangers can't probe whether we run Cosmos.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stranger_data_gets_silence() {
+    let net = FakeSteamNet::new();
+    let dir = Arc::new(StaticDirectory::default());
+    let _a = node(&net, SA, &dir);
+    let x: Arc<FakeSteam> = net.backend(SX);
+    x.send(SA, &[bind::DATA, 1, 2, 3], true).unwrap();
+    let end = Instant::now() + Duration::from_millis(400);
+    while Instant::now() < end {
+        let mut evs = vec![];
+        x.poll(&mut evs);
+        for e in evs {
+            if let SteamEvent::Message { data, .. } = e {
+                panic!("stranger got a reply: kind {}", data[0]);
+            }
+        }
+        sleep(Duration::from_millis(5)).await;
+    }
+}

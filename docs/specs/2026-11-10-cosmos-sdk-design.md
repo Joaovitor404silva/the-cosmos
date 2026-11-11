@@ -30,7 +30,7 @@ While on the Steam relay, the SDK keeps retrying direct in the background and mi
 
 ### Steam backend details
 - Uses `ISteamNetworkingMessages` (SDR) and Steam lobbies for invites/signaling.
-- The SDK ships its own `steam_api64.dll` (Steamworks redistributable) and inits Steam itself when the game isn't a Steam game or has no Steam API (emulated games, non-Steam builds). Release builds must set an AppID; debug builds fall back to 480 (Spacewar).
+- The SDK ships its own `steam_api64.dll` (Steamworks redistributable) and inits Steam itself when the game isn't a Steam game or has no Steam API (emulated games, non-Steam builds). Release builds without an AppID never init Steam themselves (the path stays off unless the game runs Steam); debug builds fall back to 480 (Spacewar).
 - If the game already initialized Steam in-process, reuse its instance and AppID instead of a second init.
 - The daemon (`cosmos-node`) can own the Steam connection out of process, so games that must not load Steam still get the relay.
 - Loaded dynamically: if the Steam client isn't running, the SDK still works (direct/punch only).
@@ -65,7 +65,7 @@ void       cosmos_shutdown(cosmos_t*);
 ## Session model
 - Max 4 peers, enforced by the host and by connection limits.
 - Topology: full mesh between ≤4 peers (6 links max); host is authority for membership.
-- Join codes: short code → Argon2id → DHT topic + join secret + AEAD key + session key. The host-signed advert body (host, addresses, secret salt) is encrypted, so DHT/gossip nodes can't read it or compute the code; the code binds the host key (forging needs ~2^40 Argon2id). Adverts carry only external addresses, plus LAN/VPN interface addresses when LAN mode is on. Steam lobby invite as an alternative when the Steam client is running.
+- Join codes: short code + UTC day → Argon2id → DHT topic + AEAD key (the host publishes under yesterday, today and tomorrow, so a code→topic table goes stale daily). The host-signed advert body (host, addresses, secret salt, random join secret, random session key) is encrypted, so DHT/gossip nodes can't read it or compute the code; the code binds the host key (forging needs ~2^40 Argon2id). Adverts carry only external addresses, plus LAN/VPN interface addresses when LAN mode is on. Steam lobby invite as an alternative when the Steam client is running.
 
 ## Security baseline (carried from bb-p2p audit)
 - Peer id = public key; all records signed; game namespace in every record key.

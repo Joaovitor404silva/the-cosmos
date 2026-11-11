@@ -238,6 +238,30 @@ fn key_file_creation_is_atomic_and_race_free() {
     assert_eq!(files, vec![std::ffi::OsString::from("id.key")], "temp files left");
 }
 
+/// Review finding 10: temp files from a crashed key write are cleaned up,
+/// fresh ones (another instance mid-write) are not.
+#[test]
+fn stale_key_temps_are_removed() {
+    let dir = std::env::temp_dir().join(format!("cosmos-ffi-keytmp-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let old = dir.join("id.tmp111");
+    let fresh = dir.join("id.tmp222");
+    let other = dir.join("other.tmp333");
+    for p in [&old, &fresh, &other] {
+        std::fs::write(p, b"x").unwrap();
+    }
+    let past = std::time::SystemTime::now() - Duration::from_secs(3600);
+    for p in [&old, &other] {
+        std::fs::File::options().write(true).open(p).unwrap().set_modified(past).unwrap();
+    }
+    assert!(load_key(Some(dir.join("id.key").to_string_lossy().into())).is_ok());
+    let (o, f, x) = (old.exists(), fresh.exists(), other.exists());
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert!(!o, "stale temp kept");
+    assert!(f, "fresh temp removed");
+    assert!(x, "unrelated file removed");
+}
+
 #[test]
 fn key_file_keeps_the_identity() {
     let dir = std::env::temp_dir().join(format!("cosmos-ffi-key-{}", std::process::id()));

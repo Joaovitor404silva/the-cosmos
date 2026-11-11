@@ -6,7 +6,8 @@
 //! proved which Cosmos peer is behind it.
 //!
 //! Bindings heal themselves:
-//! - frames from an unbound SteamID make us ask it for a proof;
+//! - frames from a SteamID we were recently bound to make us ask it for a
+//!   proof (anyone else gets silence: no presence oracle);
 //! - a `HELLO` from a bound SteamID makes us re-check it, so a peer that
 //!   restarted with a new key on the same Steam account rebinds (the old
 //!   peer gets `Down`);
@@ -22,6 +23,7 @@
 //! bindings, and proofs are rate limited.
 
 use crate::backend::{MAX_MESSAGE, SendError, SteamBackend, SteamEvent, SteamId};
+
 use crate::bind::{self, DATA, FRAG, FRAG_FIRST, FRAG_LAST, HELLO, HELLO_BACK, Nonce, PROOF};
 use crate::record::SteamDirectory;
 use cosmos_core::transport::FRAME_MAX;
@@ -33,6 +35,10 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// How long an unbound SteamID may re-ask for a proof, and how many we keep.
+const KNOWN_TTL: Duration = Duration::from_secs(120);
+const MAX_KNOWN: usize = 64;
 use tokio::sync::{Notify, mpsc};
 
 #[derive(Clone, Debug)]
@@ -99,11 +105,19 @@ struct State {
     /// Frames being rebuilt from pieces.
     asm: HashMap<SteamId, Vec<u8>>,
     tokens: (u32, Option<Instant>),
+    /// Recently unbound SteamIDs: their frames may still re-ask for a proof.
+    known: HashMap<SteamId, Instant>,
 }
 
 impl State {
     fn unbind(&mut self, steam: SteamId) -> Option<PeerId> {
         let b = self.by_steam.remove(&steam)?;
+        if self.known.len() >= MAX_KNOWN
+            && let Some(old) = self.known.iter().min_by_key(|(_, t)| **t).map(|(k, _)| *k)
+        {
+            self.known.remove(&old);
+        }
+        self.known.insert(steam, Instant::now());
         if self.by_peer.get(&b.peer) == Some(&steam) {
             self.by_peer.remove(&b.peer);
         }
@@ -199,7 +213,10 @@ impl SteamTransport {
         self.shared.my_steam
     }
 
-    /// The join code's session key: tags our hellos and admits members'.
+    /// The session key (from the join advert): tags our hellos and admits
+    /// members'. Both sides need it before `connect_steam` can bind: until
+    /// the other side has it, our HELLO goes unanswered and `connect_steam`
+    /// keeps retrying until its handshake timeout.
     pub fn set_session_key(&self, key: [u8; 32]) {
         *self.shared.session.lock().unwrap() = Some(key);
     }
@@ -317,7 +334,9 @@ impl Shared {
             if last_gc.elapsed() >= Duration::from_secs(1) {
                 last_gc = Instant::now();
                 let ttl = self.cfg.handshake_timeout * 2;
-                self.state.lock().unwrap().pending.retain(|_, p| p.since.elapsed() < ttl);
+                let mut st = self.state.lock().unwrap();
+                st.pending.retain(|_, p| p.since.elapsed() < ttl);
+                st.known.retain(|_, t| t.elapsed() < KNOWN_TTL);
             }
         }
     }
@@ -358,14 +377,17 @@ impl Shared {
     fn on_data(&self, from: SteamId, kind: u8, mut data: Vec<u8>) {
         let mut st = self.state.lock().unwrap();
         let Some(b) = st.by_steam.get_mut(&from) else {
-            // They think we are bound: ask who they are (rate limited).
+            // They think we are bound: ask who they are (rate limited), if we
+            // ever were bound to them.
+            let known = st.known.contains_key(&from);
             let ask = match st.pending.get_mut(&from) {
                 Some(p) if p.last_hello.elapsed() >= self.cfg.hello_every => {
                     p.last_hello = Instant::now();
                     Some(p.nonce)
                 }
                 Some(_) => None,
-                None => st.pending_inbound(from, self.cfg.max_pending),
+                None if known => st.pending_inbound(from, self.cfg.max_pending),
+                None => None,
             };
             drop(st);
             if let Some(n) = ask {
