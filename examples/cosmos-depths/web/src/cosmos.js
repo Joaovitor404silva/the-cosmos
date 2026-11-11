@@ -30,8 +30,14 @@ const PUT_RATE = 10, PUT_WINDOW = 10000;
 const ADVERT_TTL = 180, ADVERT_REFRESH = 60000;
 const JOIN_DEADLINE = 30000, RESOLVE_DEADLINE = 20000;
 const MAX_CHECKED = 4;
-const PING_EVERY = 1000, LINK_DEAD = 10000;
 const DAY = 86400;
+const PING_EVERY = 1000, LINK_DEAD = 10000;
+const QUERY_MAX = 256; // events kept per record query
+const ADVERT_SCAN = 64, ADVERT_OPEN_MAX = 32; // adverts read / decrypted per resolve round
+const RECORD_TTL_MAX = 30 * DAY;
+const PENDING_FRAMES = 64, PENDING_BYTES = 512 << 10; // reliable frames held for a not-yet-announced peer
+const MAX_STRANGERS = 4; // inbound links not announced yet
+const SIGNAL_RATE = 20, SIGNAL_WINDOW = 10000; // per sender
 const ICE = [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun.cloudflare.com:3478' }];
 
 const enc = new TextEncoder(), dec = new TextDecoder();
@@ -83,6 +89,16 @@ async function open(key32, aad, sealed) {
   } catch {
     return null;
   }
+}
+
+const tagOf = (ev, name) => (Array.isArray(ev.tags) ? ev.tags.find((t) => Array.isArray(t) && t[0] === name)?.[1] : undefined);
+// a record event under the topic `d`, still live, with sane times
+function liveRecord(ev, d) {
+  if (ev?.kind !== KIND_RECORD || tagOf(ev, 'd') !== d || typeof ev.content !== 'string') return null;
+  if (!Number.isSafeInteger(ev.created_at) || ev.created_at <= 0 || ev.created_at > now() + 60) return null;
+  const exp = Number(tagOf(ev, 'expiration'));
+  if (!Number.isSafeInteger(exp) || exp <= now() || exp > now() + RECORD_TTL_MAX) return null;
+  return exp;
 }
 
 const nameOk = (s) => typeof s === 'string' && /^[A-Za-z0-9_.-]{1,64}$/.test(s);
@@ -145,6 +161,8 @@ class Link {
     this.rel.binaryType = this.unrel.binaryType = 'arraybuffer';
     this.lastRx = Date.now();
     this.dead = false;
+    this.held = []; // reliable frames from a peer not announced yet
+    this.heldBytes = 0;
     this.opened = new Promise((ok) => (this.rel.onopen = ok));
     this.rel.onmessage = (m) => this.rx(new Uint8Array(m.data), true);
     this.unrel.onmessage = (m) => this.rx(new Uint8Array(m.data), false);
@@ -248,6 +266,7 @@ export class Cosmos {
     this.expected = new Set(); // member: announced by host, link maybe not open yet
     this.pendingAnswers = new Map(); // conn id -> resolve
     this.waiters = new Map(); // pub -> resolve(ctrl) for join handshake
+    this.sigSeen = new Map(); // sender pub -> recent signal times
     this.ended = false;
     this.closed = false;
     this.timers = [setInterval(() => this.tick(), PING_EVERY)];
@@ -308,9 +327,9 @@ export class Cosmos {
     if (!r.ok) fail(E_NET, 'publish failed: ' + r.message);
   }
 
-  toRecord(kind, key, ev) {
-    const exp = Number(ev.tags.find((t) => t[0] === 'expiration')?.[1] || 0);
-    if (!(exp > now())) return null;
+  toRecord(kind, key, d, ev) {
+    const exp = liveRecord(ev, d);
+    if (!exp) return null;
     let data;
     try {
       data = unb64(ev.content);
@@ -335,11 +354,12 @@ export class Cosmos {
           done();
         };
         id = this.pool.sub([{ kinds: [KIND_RECORD], '#d': [d], limit: 64 }], (ev) => {
+          if (!liveRecord(ev, d)) return;
           const old = best.get(ev.pubkey);
           if (!old || ev.created_at > old.created_at) best.set(ev.pubkey, ev);
-        }, finish);
+        }, finish, QUERY_MAX);
       });
-      const recs = [...best.values()].map((e) => this.toRecord(kind, key, e)).filter(Boolean).sort((a, b) => a.issued_ms - b.issued_ms);
+      const recs = [...best.values()].map((e) => this.toRecord(kind, key, d, e)).filter(Boolean).sort((a, b) => a.issued_ms - b.issued_ms);
       if (recs.length === 0) this.push({ kind: EV_RECORD_RESULT, req_id: reqId, error: OK, index: 0, count: 0 });
       recs.forEach((r, i) => this.push({ kind: EV_RECORD_RESULT, req_id: reqId, error: OK, index: i, count: recs.length, ...r }));
     })().catch((e) => this.push({ kind: EV_RECORD_RESULT, req_id: reqId, error: E_NET, message: String(e.message || e), index: 0, count: 0 }));
@@ -349,7 +369,7 @@ export class Cosmos {
     const d = this.recTag(kind, key);
     const sub = this.nextSub++;
     const id = this.pool.sub([{ kinds: [KIND_RECORD], '#d': [d], since: now() - 2 }], (ev) => {
-      const r = this.toRecord(kind, key, ev);
+      const r = this.toRecord(kind, key, d, ev);
       if (r) this.push({ kind: EV_RECORD_UPDATE, req_id: sub, ...r });
     });
     this.subs.set(sub, id);
@@ -406,13 +426,14 @@ export class Cosmos {
         let id;
         const timer = setTimeout(() => finish(), 5000);
         const finish = () => { clearTimeout(timer); this.pool.unsub(id); done(); };
-        id = this.pool.sub([{ kinds: [KIND_RECORD], '#d': [k.d], limit: 16 }], (ev) => found.push(ev), finish);
+        id = this.pool.sub([{ kinds: [KIND_RECORD], '#d': [k.d], limit: ADVERT_SCAN }], (ev) => liveRecord(ev, k.d) && found.push(ev), finish, ADVERT_SCAN * 2);
       });
       const hosts = new Map();
+      let opened = 0;
       for (const ev of found.sort((a, b) => b.created_at - a.created_at)) {
-        if (hosts.size >= MAX_CHECKED + 1) break;
-        const exp = Number(ev.tags.find((t) => t[0] === 'expiration')?.[1] || 0);
-        if (exp <= now() || hosts.has(ev.pubkey)) continue;
+        if (hosts.size >= MAX_CHECKED + 1 || opened >= ADVERT_OPEN_MAX) break;
+        if (hosts.has(ev.pubkey)) continue;
+        opened++;
         let plain;
         try { plain = await open(k.key, enc.encode(k.d), unb64(ev.content)); } catch { plain = null; }
         if (!plain) continue;
@@ -441,6 +462,7 @@ export class Cosmos {
     this.hostPub = a.h;
     this.listenSignals();
     const deadline = Date.now() + JOIN_DEADLINE;
+    const tries = [];
     try {
       const host = await this.connect(a.h, deadline);
       let w;
@@ -453,14 +475,27 @@ export class Cosmos {
       if (w.t === 'reject') fail(E_FULL, 'the run is full');
       if (w.t !== 'welcome' || !Array.isArray(w.m) || w.m.length >= MAX_PEERS) fail(E_NET, 'bad welcome');
       const others = w.m.filter((p) => typeof p === 'string' && /^[0-9a-f]{64}$/.test(p) && p !== this.pub && p !== a.h);
-      await Promise.all(others.map((p) => this.connect(p, deadline)));
+      tries.push(...others.map((p) => this.connect(p, deadline)));
+      const got = await Promise.allSettled(tries);
+      const bad = got.find((r) => r.status === 'rejected');
+      if (bad) throw bad.reason;
+      // a link that died while we waited was dropped silently: never report it joined
+      const alive = () => [a.h, ...others].every((p) => this.links.get(p)?.isOpen());
+      if (!alive()) fail(E_NET, 'a peer went away during the join');
+      const admitted = this.waitCtrl(a.h, deadline);
+      if (host.ctrl({ t: 'ready' }) !== OK) fail(E_NET, 'lost the host during the join');
+      const ack = await admitted;
+      if (ack.t === 'reject') fail(E_FULL, 'the run is full');
+      if (ack.t !== 'admitted') fail(E_NET, 'the host did not admit us');
+      if (!alive()) fail(E_NET, 'a peer went away during the join');
       this.role = 'member';
-      host.ctrl({ t: 'ready' });
       for (const p of [a.h, ...others]) this.announce(p);
     } catch (e) {
+      Promise.allSettled(tries); // the rest fail on their own; nobody awaits them
       for (const l of this.links.values()) l.close();
       this.links.clear();
-      this.hostPub = this.secret = null;
+      this.waiters.delete(a.h);
+      this.hostPub = this.secret = this.sigKey = null;
       this.role = null;
       if (this.sigSub) this.pool.unsub(this.sigSub);
       this.sigSub = null;
@@ -481,6 +516,13 @@ export class Cosmos {
     const h = this.handle(pub);
     this.push({ kind: EV_PEER_JOINED, peer: h });
     this.push({ kind: EV_PATH_CHANGED, peer: h, path: PATH_DIRECT });
+    // frames that beat the announcement (a hello sent right after admission)
+    const l = this.links.get(pub);
+    if (l) {
+      for (const b of l.held) this.push({ kind: EV_MESSAGE, peer: h, channel: b[1], reliable: 1, data: b.slice(2) });
+      l.held = [];
+      l.heldBytes = 0;
+    }
   }
 
   // ---- signalling ----------------------------------------------------------
@@ -495,10 +537,20 @@ export class Cosmos {
   }
 
   async onSignal(ev) {
-    if (this.closed || !this.sigKey || ev.pubkey === this.pub || now() - ev.created_at > 30) return;
-    const plain = await open(this.sigKey, enc.encode(ev.pubkey + this.pub), unb64(ev.content));
+    if (this.closed || !this.sigKey || ev.pubkey === this.pub || !Number.isSafeInteger(ev.created_at) || now() - ev.created_at > 30) return;
+    const t = Date.now();
+    const seen = (this.sigSeen.get(ev.pubkey) || []).filter((x) => t - x < SIGNAL_WINDOW);
+    if (seen.length >= SIGNAL_RATE) return;
+    seen.push(t);
+    this.sigSeen.set(ev.pubkey, seen);
+    if (this.sigSeen.size > 256) for (const [p, v] of this.sigSeen) if (!v.some((x) => t - x < SIGNAL_WINDOW)) this.sigSeen.delete(p);
+    if (typeof ev.content !== 'string') return;
+    let sealed;
+    try { sealed = unb64(ev.content); } catch { return; }
+    const plain = await open(this.sigKey, enc.encode(ev.pubkey + this.pub), sealed);
     if (!plain) return; // not a holder of this run's code
     const m = JSON.parse(dec.decode(plain));
+    if (!m || typeof m !== 'object') return;
     if (m.t === 'answer') {
       this.pendingAnswers.get(m.c)?.(m.sdp);
     } else if (m.t === 'offer' && typeof m.sdp === 'string') {
@@ -508,6 +560,11 @@ export class Cosmos {
       if (old && old.conn === m.c) { // a resent offer: our answer may have been lost
         if (old.answer) await this.signal(ev.pubkey, { t: 'answer', c: m.c, sdp: old.answer });
         return;
+      }
+      if (!old) {
+        let strangers = 0;
+        for (const [p, x] of this.links) if (!this.members.has(p) && p !== this.hostPub && !x.dead) strangers++;
+        if (strangers >= MAX_STRANGERS) return;
       }
       old?.close();
       const l = new Link(this, ev.pubkey, m.c);
@@ -543,7 +600,7 @@ export class Cosmos {
 
   // ---- frames --------------------------------------------------------------
   onFrame(l, b, reliable) {
-    if (this.links.get(l.pub) !== l) return;
+    if (this.links.get(l.pub) !== l || b.length > MSG_MAX + 2) return;
     if (!reliable) {
       if (this.members.has(l.pub) && b.length >= 1)
         this.push({ kind: EV_MESSAGE, peer: this.handle(l.pub), channel: b[0], reliable: 0, data: b.slice(1) });
@@ -551,8 +608,12 @@ export class Cosmos {
     }
     if (b[0] === 2) return; // ping
     if (b[0] === 1) {
-      if (this.members.has(l.pub) && b.length >= 2)
-        this.push({ kind: EV_MESSAGE, peer: this.handle(l.pub), channel: b[1], reliable: 1, data: b.slice(2) });
+      if (b.length < 2) return;
+      if (this.members.has(l.pub)) this.push({ kind: EV_MESSAGE, peer: this.handle(l.pub), channel: b[1], reliable: 1, data: b.slice(2) });
+      else if (l.held.length < PENDING_FRAMES && l.heldBytes + b.length <= PENDING_BYTES) {
+        l.held.push(b.slice());
+        l.heldBytes += b.length;
+      }
       return;
     }
     if (b[0] !== 0) return;
@@ -569,13 +630,14 @@ export class Cosmos {
         if (c.s !== bytesToHex(this.secret)) return l.close();
         if (this.members.size + 1 >= MAX_PEERS) { l.ctrl({ t: 'reject' }); setTimeout(() => l.close(), 500); return; }
         // one joiner at a time, so every joiner's welcome lists every member
-        const busy = [...this.links.values()].some((x) => x !== l && x.joining && !x.dead && Date.now() - x.joining < 15000);
+        const busy = [...this.links.values()].some((x) => x !== l && x.joining && !x.dead && Date.now() - x.joining < JOIN_DEADLINE + 5000);
         if (busy) return l.ctrl({ t: 'busy' });
         l.joining = Date.now();
         l.ctrl({ t: 'welcome', m: [...this.members] });
       } else if (c.t === 'ready' && l.joining && !this.members.has(from)) {
         l.joining = 0;
         if (this.members.size + 1 >= MAX_PEERS) { l.ctrl({ t: 'reject' }); setTimeout(() => l.close(), 500); return; }
+        if (l.ctrl({ t: 'admitted' }) !== OK) return this.drop(from);
         for (const p of this.members) this.links.get(p)?.ctrl({ t: 'joined', p: from });
         this.announce(from);
       } else if (c.t === 'leave') {
@@ -599,6 +661,7 @@ export class Cosmos {
 
   onDown(l, why) {
     if (this.links.get(l.pub) !== l) return;
+    if (this.waiters.has(l.pub)) this.waiters.get(l.pub)({ t: 'down' }); // a join waiting on this peer
     if (this.role === 'member' && l.pub === this.hostPub) return this.end();
     this.drop(l.pub);
   }

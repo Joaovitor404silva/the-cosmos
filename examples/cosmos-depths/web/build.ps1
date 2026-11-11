@@ -87,6 +87,15 @@ emcc @flags -Wall -Werror -Wno-unused-function `
 Copy-Item -Force (Join-Path $web 'build\cosmos-web.js') $dist
 Copy-Item -Force (Join-Path $web 'node_modules\coi-serviceworker\coi-serviceworker.min.js') (Join-Path $dist 'coi-serviceworker.js')
 Copy-Item -Force (Join-Path $web 'shell.html') (Join-Path $dist 'index.html')
-Copy-Item -Force (Join-Path $rl 'LICENSE') (Join-Path $dist 'raylib-LICENSE.txt')
-Copy-Item -Force $fontLicense (Join-Path $dist 'JetBrainsMono-OFL.txt')
+Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $dist 'raylib-LICENSE.txt'), (Join-Path $dist 'JetBrainsMono-OFL.txt')
+$notices = @(
+    @('raylib (zlib)', (Join-Path $rl 'LICENSE')),
+    @('JetBrains Mono font (SIL OFL 1.1)', $fontLicense),
+    @('Emscripten runtime (MIT)', (Join-Path $emsdk 'upstream\emscripten\LICENSE')),
+    @('@noble/curves (MIT)', (Join-Path $web 'node_modules\@noble\curves\LICENSE')),
+    @('@noble/hashes (MIT)', (Join-Path $web 'node_modules\@noble\hashes\LICENSE')),
+    @('hash-wasm (MIT)', (Join-Path $web 'node_modules\hash-wasm\LICENSE')),
+    @('coi-serviceworker (MIT)', (Join-Path $web 'node_modules\coi-serviceworker\LICENSE'))
+) | ForEach-Object { "==== $($_[0]) ====`n`n" + (Get-Content -Raw $_[1]).Trim() + "`n" }
+[IO.File]::WriteAllText((Join-Path $dist 'THIRD_PARTY_NOTICES.txt'), "Third-party software in Cosmos Depths (web)`n`n" + ($notices -join "`n"))
 Write-Host "built $dist"

@@ -145,9 +145,10 @@ export class RelayPool {
     const [t, a, b, c] = msg;
     if (t === 'EVENT') {
       const s = this.subs.get(a);
-      if (!s || !b || s.seen.has(b.id)) return;
+      if (!s || !b || s.seen.has(b.id) || s.got >= s.max) return; // a hostile relay can't grow a query without bound
       if (!verifyEvent(b)) return;
       s.seen.add(b.id);
+      s.got++;
       if (s.seen.size > 4096) s.seen = new Set([...s.seen].slice(-2048));
       s.onEvent(b);
     } else if (t === 'EOSE' || t === 'CLOSED') {
@@ -200,9 +201,9 @@ export class RelayPool {
     for (const r of this.relays) r.send(['EVENT', ev]);
   }
 
-  sub(filters, onEvent, onEose) {
+  sub(filters, onEvent, onEose, max = Infinity) {
     const id = 'c' + this.next++;
-    const s = { filters, onEvent, onEose, seen: new Set(), eosed: new Set(), eoseFired: false };
+    const s = { filters, onEvent, onEose, seen: new Set(), eosed: new Set(), eoseFired: false, got: 0, max };
     this.subs.set(id, s);
     for (const r of this.relays) if (r.open) r.raw(['REQ', id, ...filters]);
     if (onEose) setTimeout(() => this.checkEose(s), 0); // nothing open: fire at once

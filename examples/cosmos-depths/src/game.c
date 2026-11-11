@@ -825,12 +825,15 @@ void game_free(Game *g, double wait) {
     int busy;
     if (!g) return;
     g->quitting = 1;
+#ifdef __EMSCRIPTEN__
+    wait = 0; /* never block the browser main thread: jobs need it to finish */
+#endif
     until = plat_now() + wait;
     do {
         Job *jobs[] = {&g->net, &g->put, &g->ghost_put, &g->lobby_put};
         busy = 0;
         for (size_t i = 0; i < sizeof jobs / sizeof jobs[0]; i++) busy |= jobs[i]->thread && !plat_thread_done(jobs[i]->thread);
-        if (busy) plat_sleep(20);
+        if (busy && plat_now() < until) plat_sleep(20);
     } while (busy && plat_now() < until);
     if (busy) {
         void *t = plat_thread(game_reap, g);

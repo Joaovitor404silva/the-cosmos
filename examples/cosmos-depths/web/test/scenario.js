@@ -20,7 +20,14 @@ async function main() {
   const ns = 'cosmos-web-test-' + Math.random().toString(36).slice(2, 8);
   const [a, b, c, d, e] = await Promise.all([0, 1, 2, 3, 4].map(() => C.Cosmos.init({ game_id: ns })));
   const ev = new Map([a, b, c, d, e].map((x) => [x, []]));
-  const pump = setInterval(() => { for (const [x, list] of ev) drain(x, list); }, 20);
+  // like the game's hello: greet every peer the moment it is announced
+  const pump = setInterval(() => {
+    for (const [x, list] of ev) {
+      const n = list.length;
+      drain(x, list);
+      for (const q of list.slice(n)) if (q.kind === C.EV_PEER_JOINED) try { x.send(q.peer, 7, new Uint8Array([7]), 1); } catch {}
+    }
+  }, 20);
   const joined = (x) => ev.get(x).filter((q) => q.kind === C.EV_PEER_JOINED).map((q) => q.peer);
 
   let t0 = Date.now();
@@ -31,13 +38,23 @@ async function main() {
   await b.join(code.toLowerCase().replace('-', ' '));
   check('B joins (normalised code)', b.hostPeer() > 0, `${Date.now() - t0} ms`);
   t0 = Date.now();
-  const both = await Promise.allSettled([c.join(code), d.join(code)]);
+  // broadcast the instant join() resolves: members may not have heard `joined` from the host yet
+  const sayHi = (x) => () => x.send(0, 8, new Uint8Array([8]), 1);
+  const both = await Promise.allSettled([c.join(code).then(sayHi(c)), d.join(code).then(sayHi(d))]);
   check('C and D join at the same time', both.every((r) => r.status === 'fulfilled'), `${Date.now() - t0} ms ${both.map((r) => r.reason?.message || '').join(' ')}`);
   const full = await e.join(code).then(() => 'joined', (x) => x.code);
   check('E is refused: run full', full === C.E_FULL, String(full));
 
   await until(() => [a, b, c, d].every((x) => joined(x).length >= 3));
   check('everyone sees 3 peers', [a, b, c, d].every((x) => joined(x).length === 3), [a, b, c, d].map((x) => joined(x).length).join(','));
+
+  await until(() => [a, b, c, d].every((x) => ev.get(x).filter((q) => q.kind === C.EV_MESSAGE && q.channel === 7).length >= 3), 5000);
+  check('greetings sent on PEER_JOINED all arrive', [a, b, c, d].every((x) => ev.get(x).filter((q) => q.kind === C.EV_MESSAGE && q.channel === 7).length === 3),
+    [a, b, c, d].map((x) => ev.get(x).filter((q) => q.kind === C.EV_MESSAGE && q.channel === 7).length).join(','));
+
+  await until(() => [a, b].every((x) => ev.get(x).filter((q) => q.kind === C.EV_MESSAGE && q.channel === 8).length >= 2), 5000);
+  check('a new joiner broadcast reaches every member', [a, b].every((x) => ev.get(x).filter((q) => q.kind === C.EV_MESSAGE && q.channel === 8).length === 2),
+    [a, b].map((x) => ev.get(x).filter((q) => q.kind === C.EV_MESSAGE && q.channel === 8).length).join(','));
 
   // messages
   const hb = b.hostPeer();
