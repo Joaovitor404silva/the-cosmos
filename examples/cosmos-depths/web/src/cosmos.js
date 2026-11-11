@@ -33,8 +33,8 @@ const MAX_CHECKED = 4;
 const DAY = 86400;
 const PING_EVERY = 1000, LINK_DEAD = 10000;
 const QUERY_MAX = 256; // events kept per record query
-const ADVERT_SCAN = 64, ADVERT_OPEN_MAX = 32; // adverts read / decrypted per resolve round
-const RECORD_TTL_MAX = 30 * DAY;
+const ADVERT_SCAN = 64; // adverts read per relay per resolve round
+const RECORD_TTL_MAX = 1800; // as native (record.rs MAX_TTL)
 const PENDING_FRAMES = 64, PENDING_BYTES = 512 << 10; // reliable frames held for a not-yet-announced peer
 const MAX_STRANGERS = 4; // inbound links not announced yet
 const SIGNAL_RATE = 20, SIGNAL_WINDOW = 10000; // per sender
@@ -317,6 +317,7 @@ export class Cosmos {
     const d = this.recTag(kind, key);
     if (data.length > RECORD_MAX) fail(E_TOO_LARGE, `record over ${RECORD_MAX} bytes`);
     if (!(ttl > 0)) fail(E_INVALID, 'ttl must be > 0');
+    ttl = Math.min(Math.ceil(ttl), RECORD_TTL_MAX);
     const t = Date.now();
     this.puts = this.puts.filter((x) => t - x < PUT_WINDOW);
     if (this.puts.length >= PUT_RATE) fail(E_RATE_LIMITED, `more than ${PUT_RATE} puts in ${PUT_WINDOW / 1000} s`);
@@ -426,14 +427,14 @@ export class Cosmos {
         let id;
         const timer = setTimeout(() => finish(), 5000);
         const finish = () => { clearTimeout(timer); this.pool.unsub(id); done(); };
-        id = this.pool.sub([{ kinds: [KIND_RECORD], '#d': [k.d], limit: ADVERT_SCAN }], (ev) => liveRecord(ev, k.d) && found.push(ev), finish, ADVERT_SCAN * 2);
+        id = this.pool.sub([{ kinds: [KIND_RECORD], '#d': [k.d], limit: ADVERT_SCAN }], (ev) => liveRecord(ev, k.d) && found.push(ev), finish, ADVERT_SCAN);
       });
       const hosts = new Map();
-      let opened = 0;
+      // every advert is opened (AES-GCM is cheap, the scan is capped per relay):
+      // junk that fails to decrypt must not push the real one out
       for (const ev of found.sort((a, b) => b.created_at - a.created_at)) {
-        if (hosts.size >= MAX_CHECKED + 1 || opened >= ADVERT_OPEN_MAX) break;
+        if (hosts.size >= MAX_CHECKED + 1) break;
         if (hosts.has(ev.pubkey)) continue;
-        opened++;
         let plain;
         try { plain = await open(k.key, enc.encode(k.d), unb64(ev.content)); } catch { plain = null; }
         if (!plain) continue;
@@ -491,7 +492,8 @@ export class Cosmos {
       this.role = 'member';
       for (const p of [a.h, ...others]) this.announce(p);
     } catch (e) {
-      Promise.allSettled(tries); // the rest fail on their own; nobody awaits them
+      // the host may have admitted us already: tell it we gave up
+      this.links.get(a.h)?.ctrl({ t: 'leave' });
       for (const l of this.links.values()) l.close();
       this.links.clear();
       this.waiters.delete(a.h);

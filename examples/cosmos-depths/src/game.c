@@ -37,6 +37,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include "depths.h"
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+static void game_free_later(void *g) { game_free(g, 0); }
+#endif
 
 enum { JOB_HOST = 1, JOB_JOIN, JOB_PUT };
 enum { CH_GAME = 1 };
@@ -838,6 +842,11 @@ void game_free(Game *g, double wait) {
     if (busy) {
         void *t = plat_thread(game_reap, g);
         if (t) { plat_thread_detach(t); return; }
+#ifdef __EMSCRIPTEN__
+        /* no free worker: reaping here would block the main thread the jobs need */
+        emscripten_async_call(game_free_later, g, 100);
+        return;
+#endif
     }
     game_reap(g);
 }
